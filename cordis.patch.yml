@@ -1,0 +1,8 @@
+# dsh-active-sessions bundle layer.
+# defaultLocked: true keeps every model-visible surface untouched (0 token cost).
+- insert:
+    - id: active-sessions
+      name: dsh-active-sessions
+      config:
+        enabled: true
+        defaultLocked: true
