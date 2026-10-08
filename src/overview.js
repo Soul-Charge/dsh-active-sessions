@@ -35,10 +35,34 @@ export const MAX_TOTAL_BYTES_PER_WORKSPACE = 2 * 1024 * 1024;
 export const MAX_DEPTH = 6;
 /** 每个扫描源的 readdir 条目预算：防止在超大目录上无限走。 */
 export const MAX_ENTRIES_PER_ROOT = 4000;
-/** 单文件写入 prompt 的摘录字符数。 */
-export const DEFAULT_EXCERPT_CHARS = 3000;
-/** 单次组装出的 prompt 字符上限。 */
-export const MAX_PROMPT_CHARS = 60000;
+/** 单文件写入 prompt 的摘录字符数（2026-10-06 由 3000 下调到 1500）。 */
+export const DEFAULT_EXCERPT_CHARS = 1500;
+
+/**
+ * 单工作区写入 prompt 的**摘录总预算**（字符）。
+ *
+ * 2026-10-06 由「无预算，只在最后整段截断」改成显式预算，理由是实测数据：
+ *   - 旧实现：40 个文件 × 3000 字符 = 120000 字符摘录，AiHarness 实测 **110101** 字符；
+ *   - 组装后的 prompt 被 MAX_PROMPT_CHARS(60000) 从**中间某个文件内部**硬切一刀，
+ *     结尾是一句被腰斩的话加「…（提示词超长，已在此截断）」；
+ *   - 于是 4 个工作区的 prompt 顶到 60016 字符，其中 5 万字符被模型看到、5 万字符被丢掉，
+ *     而模型为这 5 万字符付了完整的上下文成本 —— 换一个「600 字 / 8 条要点」的输出。
+ *
+ * 24k 字符的依据：输出上限是 8 条要点 / 600 字（summarize.js 的 SYSTEM_PROMPT），
+ * 24k 字符证据是它的约 40 倍，足够判断「这个工作区做过什么」；
+ * 同时对 32k 上下文的小模型也留得下输出余量（24k 中英混排 ≈ 12~20k token + 4096 输出）。
+ * 超出预算的文件**仍会列出路径**，只是不再附带摘录（路径本身就是「我做过什么」的证据），
+ * 并显式标注「摘录预算已用尽」——比腰斩在句子中间友好得多。
+ */
+export const MAX_EXCERPT_CHARS_PER_WORKSPACE = 24000;
+
+/**
+ * 单次组装出的 prompt 字符上限（硬背压，2026-10-06 由 60000 下调到 32000）。
+ *
+ * 有了 MAX_EXCERPT_CHARS_PER_WORKSPACE 之后，正常情况下永远碰不到这个上限
+ * （24k 摘录 + 最多 40 个文件头 ≈ 27k）。保留它是为了「配置被人调到极端值」时不至于炸掉模型。
+ */
+export const MAX_PROMPT_CHARS = 32000;
 
 /**
  * 目录剪枝集合（小写比较）。
@@ -65,7 +89,7 @@ const ROOT_FILE_SOURCES = [
 
 /**
  * 纳入顺序。为什么需要它：文件数上限是「每工作区 40」，如果按相对路径纯字典序截断，
- * 排序靠前的源会吃光配额。实测 workspace 工作区 67 个候选里，
+ * 排序靠前的源会吃光配额。实测 AiHarness 工作区 67 个候选里，
  * .agents/notes(19) + dsh/plugins(14) + AGENTS.md(1) 就占掉 34 个名额，
  * tasks/ 的 33 个任务文档只剩 6 个能进来 —— 而 tasks/ 恰恰是「我做过什么」的主证据。
  * 改成按 kind 轮流取，每个源都能分到配额。
@@ -186,7 +210,18 @@ function normalizeOptions(options) {
   const dshHome =
     typeof doc.dshHome === 'string' && doc.dshHome.trim() !== ''
       ? doc.dshHome.trim()
-      : path.join(os.homedir(), '.dsh');
+      // 2026-10-06：补上 DSH_HOME 环境变量这一层。此前本模块**只**认 os.homedir()，
+      // 而 states.js / approval.js / index.js 全都优先认 DSH_HOME ——
+      // 于是「DSH_HOME 指向别处」的部署下，states 读的是 A 家的投影，overview 读的是 B 家的
+      // workspace.json，两边对不上却没有任何告警。现在与其余模块保持一致。
+      : (typeof process !== 'undefined' &&
+          process !== null &&
+          typeof process.env === 'object' &&
+          process.env !== null &&
+          typeof process.env.DSH_HOME === 'string' &&
+          process.env.DSH_HOME.trim() !== ''
+        ? process.env.DSH_HOME.trim()
+        : path.join(os.homedir(), '.dsh'));
   return {
     generate: doc.generate === true,
     now: typeof doc.now === 'number' && Number.isFinite(doc.now) ? doc.now : Date.now(),
@@ -207,8 +242,50 @@ function normalizeOptions(options) {
     maxDepth: positiveNumber(doc.maxDepth, MAX_DEPTH),
     maxEntriesPerRoot: positiveNumber(doc.maxEntriesPerRoot, MAX_ENTRIES_PER_ROOT),
     excerptChars: positiveNumber(doc.excerptChars, DEFAULT_EXCERPT_CHARS),
+    maxExcerptCharsPerWorkspace: positiveNumber(
+      doc.maxExcerptCharsPerWorkspace,
+      MAX_EXCERPT_CHARS_PER_WORKSPACE,
+    ),
     explicitRoots: normalizeExplicitRoots(doc),
+    hiddenCwds: normalizeHiddenCwds(doc.hiddenCwds),
   };
+}
+
+/**
+ * 归一化「已隐藏工作区」集合（2026-10-07）。
+ *
+ * 输入既可能是 Set（服务端内存名单），也可能是落盘 JSON 的数组。
+ * 这里是**第二道**窄化：第一道是 rpc.js 的 normalizeWorkspaceCwd
+ * （端点入口处收紧外部输入），本函数负责「无论从哪来，非字符串一律不认」。
+ * 之所以还要一道：scanOverview 是导出的公开函数，集成方可以任意传 options，
+ * 不能假设调用方已经窄化过。
+ *
+ * 刻意**不**在这里做 path.resolve：键必须与 discoverWorkspaceRoots 用的是同一形态，
+ * 而那边已经是 resolve 之后的绝对路径；在本模块重复 resolve 只会增加漂移面。
+ */
+function normalizeHiddenCwds(value) {
+  const out = new Set();
+  if (value === null || typeof value !== 'object') return out;
+  // ⚠️ 必须显式处理 **Map**：服务端传进来的就是 Map（cwd -> 时间戳），
+  // 而 Map **不是** Set 的实例。首版只判了 Set/Array，结果 index.js 传 Map 时
+  // 这里恒返回空 Set —— 表现为「接口回 ok=true、文件也写了，但列表里一个都没少」，
+  // 且没有任何告警。烟测当场抓到的。
+  const items = value instanceof Map ? value.keys()
+    : Array.isArray(value) ? value
+      : (typeof value[Symbol.iterator] === 'function' ? value : null);
+  if (items === null) return out;
+  for (const item of items) {
+    // 形状 + 语义双检：除了「必须是字符串」，还必须是 POSIX 绝对路径。
+    // 只查 typeof 是不够的 —— 首版正因如此把 'rel/path' 当成了合法隐藏键，
+    // 单测 temp-e2e-hidden-workspaces 的第 10 组当场抓到（hidden=2 而不是 1）。
+    // 相对路径永远匹配不上任何 root.cwd，留着它只会让 hiddenWorkspaces 计数虚高。
+    if (typeof item !== 'string' || item === '' || item.length > 4096) continue;
+    if (!item.startsWith('/') || item.includes('\\')) continue;
+    // eslint-disable-next-line no-control-regex -- 控制字符检测正是这里的意图
+    if (/[\u0000-\u001f\u007f]/.test(item)) continue;
+    out.add(item);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -682,11 +759,27 @@ async function scanWorkspace(root, opts, bag) {
   }
 
   // 只有显式 generate 时才读正文；默认路径纯元数据，物理上不可能产生 token。
+  //
+  // 摘录预算（2026-10-06）：按文件顺序分配总预算，用完即止。
+  // 为什么不是「读完再整段截断」：那会在句子中间腰斩（见 MAX_EXCERPT_CHARS_PER_WORKSPACE 注释），
+  // 而且已经付了 I/O 与内存代价。这里超预算的文件只留路径 + 显式标注，模型仍看得见文件清单。
   if (opts.generate) {
+    let budget = opts.maxExcerptCharsPerWorkspace;
+    let skippedForBudget = 0;
     for (const file of files) {
+      if (budget <= 0) {
+        // 预算耗尽：不再读盘（省 I/O），只标记。
+        file.excerpt = '（摘录预算已用尽，仅列出路径）';
+        file.excerptOmitted = true;
+        skippedForBudget += 1;
+        continue;
+      }
       try {
-        const excerpt = await readExcerpt(file.path, opts.excerptChars);
+        const allow = Math.max(0, Math.min(opts.excerptChars, budget));
+        const excerpt = await readExcerpt(file.path, allow);
         file.excerpt = excerpt.truncated ? excerpt.text + '\n…（摘录已截断）' : excerpt.text;
+        file.excerptOmitted = false;
+        budget -= excerpt.text.length;
       } catch (error) {
         report(
           bag,
@@ -699,6 +792,21 @@ async function scanWorkspace(root, opts, bag) {
           }),
         );
       }
+    }
+    if (skippedForBudget > 0) {
+      report(bag, {
+        operation: '分配摘录预算',
+        target: root.cwd,
+        error_code: 'EXCERPT_BUDGET_EXHAUSTED',
+        input_summary: String(skippedForBudget) + ' 个文件仅列出路径',
+        message: '摘录预算已用尽，后续文件只列出路径（模型仍可见完整文件清单）',
+        context: {
+          maxExcerptCharsPerWorkspace: opts.maxExcerptCharsPerWorkspace,
+          excerptCharsPerFile: opts.excerptChars,
+          pathOnly: skippedForBudget,
+          files: files.length,
+        },
+      });
     }
   }
 
@@ -805,8 +913,8 @@ export async function scanOverview(options = {}) {
   const opts = normalizeOptions(options);
   const bag = { warnings: [], diagnostics: [] };
 
-  const roots = await discoverWorkspaceRoots(opts, bag);
-  if (roots.length === 0) {
+  const discovered = await discoverWorkspaceRoots(opts, bag);
+  if (discovered.length === 0) {
     report(bag, {
       operation: '发现工作区根目录',
       target: opts.workspaceFile,
@@ -820,6 +928,20 @@ export async function scanOverview(options = {}) {
       },
     });
   }
+
+  // ── 隐藏名单过滤（2026-10-07）────────────────────────────────────────────
+  // 语义边界（用户明确要求）：被隐藏的工作区**只是不显示在总览页**。
+  // 本插件不写 workspace.json、不调 DSH 的 workspaces 服务，DSH 的侧栏/会话记录一律不受影响。
+  //
+  // 为什么在**扫描之前**就滤掉（而不是扫完再从结果里删）：
+  //   隐藏一个工作区的意图就是「我不想在总览里看它」，那就连它那棵目录树都别读。
+  //   实测隐藏一个 /mnt/* 上的大工作区能省掉整棵树的 readdir + stat（本机 /mnt 是 9P，很贵）。
+  //
+  // ⚠️ NO_WORKSPACE_ROOT 的判定用的是**过滤前**的 discovered.length：
+  //   全部工作区都被隐藏 ≠ 「没有发现任何工作区根目录」。
+  //   早前版本会在这里误报，改用过滤后长度判断后告警又错了——这是两个不同的事实，必须分开记。
+  const roots = discovered.filter((root) => !opts.hiddenCwds.has(root.cwd));
+  const hiddenFromScan = discovered.length - roots.length;
 
   // 顺序扫描：/mnt/* 是 9P 挂载，并发 readdir 反而更容易把 IO 打满并拖慢所有工作区。
   const workspaces = [];
@@ -839,7 +961,26 @@ export async function scanOverview(options = {}) {
     generatedAt: opts.now,
     generate: opts.generate,
     workspaces: workspaces,
+    /**
+     * 汇总口径（刻意选择，写在这里以免日后被人「顺手改成全部」）：
+     * **counts 统计的是「隐藏之后、实际出现在这一页上的」工作区**，
+     * 因此 counts.workspaces === workspaces.length 恒成立，
+     * 页头那句「N 个工作区 · M 个文件」与下面看到的卡片永远对得上。
+     * 若改成统计「全部」，用户会看到 3 张卡片却顶着「21 个工作区 · 400 个文件」的字样，
+     * 那比「少显示了」更让人以为数据坏了。
+     * 想看全量请看下面的 hiddenWorkspaces / hiddenFromScan 两个字段。
+     */
     counts: counts,
+    /**
+     * 隐藏名单里的条目总数（= 插件隐藏名单的条数，**不等于**本页被滤掉的个数）。
+     * 两者可以不等：被隐藏的 cwd 可能已经不再是任何工作区根（例如它在 workspace.json 里
+     * 被删了），此时名单里仍有它，但这一页并没有「少了什么」。
+     * 客户端工具栏的「已隐藏（N）」与恢复列表用这个数——它必须与可恢复的条目数一致，
+     * 否则用户会看到一个自己没法恢复的计数。
+     */
+    hiddenWorkspaces: opts.hiddenCwds.size,
+    /** 本次扫描里**真正被滤掉**的个数（= discovered.length - roots.length）。 */
+    hiddenFromScan: hiddenFromScan,
     warnings: bag.warnings,
     diagnostics: bag.diagnostics,
   };

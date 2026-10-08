@@ -24,11 +24,18 @@ export async function listAvailableModels(ctx) {
     llm = ctx.get("llm")
   } catch (error) {
     warnings.push(issue("获取 llm 服务", "ctx.get(\"llm\")", error))
-    return { models: [], warnings }
+    return { models: [], warnings, llmAvailable: false }
   }
   if (llm === undefined || llm === null) {
-    warnings.push("llm 服务不可用：模型下拉将退化为跟随会话默认模型")
-    return { models: [], warnings }
+    // ⚠️ 文案与 error_code 都要跟前端的状态机对齐：
+    //   ui/overview.js 的 modelsLoaded=true + models.length===0 → 显示「模型服务不可用」并禁用生成按钮。
+    //   此前这里说「将退化为跟随会话默认模型」——**那条路根本不存在**
+    //   （dsh-llm 的 LlmCallConfig.provider/model 都是必填 string），
+    //   正是这个假承诺把用户带进了「点了没内容」的坑。
+    warnings.push(
+      issue('获取 llm 服务', 'ctx.get("llm")', new Error('llm 服务未注册，无法列举模型'), 'LLM_SERVICE_UNAVAILABLE'),
+    )
+    return { models: [], warnings, llmAvailable: false }
   }
 
   let providers = []
@@ -75,7 +82,13 @@ export async function listAvailableModels(ctx) {
 
   // 排序保证下拉顺序稳定（不依赖 provider 注册顺序）
   models.sort((a, b) => (a.provider === b.provider ? a.id.localeCompare(b.id) : a.provider.localeCompare(b.provider)))
-  return { models, warnings }
+  // ⚠️ llmAvailable 与 models.length 是**两件事**，必须分开报：
+  //   · llmAvailable=false → 真的没有模型服务，任何生成都不可能成功 → 调用方必须 fail-fast；
+  //   · llmAvailable=true 但 models=[] → 服务在，只是该适配器**不通过 listModels 声明目录**
+  //     （自建 / 本地适配器常见）。此时 'provider/model' 自描述形式仍可能调得通，
+  //     所以不能因为「目录为空」就一票否决 —— 2026-10-07 端到端自测实测到这条边界：
+  //     一次过严的短路会把 tests/temp-e2e-overview-persist.mjs（mock llm 无 listModels）打红。
+  return { models, warnings, llmAvailable: true }
 }
 
 /**
@@ -84,7 +97,7 @@ export async function listAvailableModels(ctx) {
  * 支持两种输入：
  *   1. "provider/model" 形式（下拉里 provider 已知时用这个最稳）；
  *   2. 裸 model id：在所有可用模型里反查唯一的 provider。
- * 反查不唯一或找不到时返回 null，由调用方回落到会话默认模型。
+ * 反查不唯一或找不到时返回 null，由调用方给出可读的失败原因（**没有会话默认模型可回落**）。
  * @param {string} selected 用户选择的模型 id
  * @param {Array<{id:string,provider:string}>} models 可用模型目录
  * @returns {{provider:string, model:string}|null}
@@ -107,9 +120,31 @@ export function resolveModelRoute(selected, models) {
   return null
 }
 
-/** 组装带上下文的错误串（禁止静默吞错）。 */
-function issue(operation, target, error) {
-  const code = error?.code ?? error?.name ?? "UNKNOWN"
-  const message = String(error?.message ?? error).slice(0, 200)
-  return "[active-sessions/models] operation=" + operation + " | target=" + String(target) + " | error_code=" + String(code) + " | context=" + JSON.stringify({ message })
+/**
+ * 组装带上下文的错误串（禁止静默吞错）。
+ *
+ * ⚠️ 格式必须与 src/overview.js 的 warnLine、src/states.js 的 describeError **完全一致**：
+ *     [operation] target -> ERROR_CODE: message {contextJson}
+ *   三个产出方曾经各写各的（key=value、竖线分隔），前端 parseWarningLine 只认这一种，
+ *   于是匹配不上的全部落进「未分组」逐条刷屏（用户实测噪音的根因）。
+ *   归一之后，前端只需要认一种形状。
+ *
+ * @param {string} operation 人类可读动作名
+ * @param {string} target 被操作对象
+ * @param {any} error 原始错误（用于取 message）
+ * @param {string} [errorCode] 真实错误码；缺省才回落到 error.code/error.name
+ */
+function issue(operation, target, error, errorCode) {
+  const raw = errorCode !== undefined && errorCode !== null && String(errorCode) !== ''
+    ? String(errorCode)
+    : (error?.code ?? error?.name ?? "UNKNOWN")
+  const code = String(raw).replace(/[^A-Za-z0-9_]/g, "_") || "UNKNOWN"
+  const message = String(error?.message ?? error)
+    .slice(0, 200)
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\{/g, "(")
+    .replace(/\}/g, ")")
+  const op = String(operation).replace(/\[/g, "(").replace(/\]/g, ")")
+  const tgt = String(target).replace(/ -> /g, " → ")
+  return "[" + op + "] " + tgt + " -> " + code + ": " + message + " " + JSON.stringify({ plugin: "dsh-active-sessions/models" })
 }

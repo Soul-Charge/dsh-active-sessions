@@ -63,6 +63,13 @@ window.__ModuleLoader__.load({
     const STORAGE_KEY = 'dsh-active-sessions.collapsed'
     const GEOMETRY_KEY = 'dsh-active-sessions.geometry'
     const LOCKED_KEY = 'dsh-active-sessions.locked'
+    /**
+     * 「已完成未查看」时间筛选的持久化键（问题二）。
+     * 取值 'recent'（默认，最近 7 天）| 'all'（有史以来）。沿用既有 dsh-active-sessions.* 命名。
+     */
+    const UNSEEN_FILTER_KEY = 'dsh-active-sessions.unseenFilter'
+    /** 「全部标记已读」按钮文案里用的天数，必须与默认筛选窗口一致。 */
+    const UNSEEN_RECENT_DAYS = 7
     /** 宽度范围：下界保证标题栏三个按钮不挤爆，上界避免吃掉主内容。 */
     const OVERLAY_MIN_WIDTH = 180
     const OVERLAY_MAX_WIDTH = 420
@@ -97,6 +104,14 @@ window.__ModuleLoader__.load({
     const PLUGIN_ID = 'dsh-active-sessions'
     /** 跨插件选中会话的解耦事件名（不写死到别人的导航接口里）。 */
     const SELECT_EVENT = 'dsh-active-sessions:select'
+    /**
+     * 跳转失败事件（2026-10-07 新增）。
+     *
+     * 为什么需要：selectEntry 的返回值**没有任何调用方消费**，导致「点击卡片但没跳转」
+     * 在界面上完全不可见 —— 真机验收时点卡片毫无反应、控制台也没有任何告警，
+     * 用户只能认为插件坏了却无法反馈。失败必须显式派发成事件，由 UI 层渲染成提示条。
+     */
+    const NAVIGATION_EVENT = 'dsh-active-sessions:navigation-failed'
     /** 模块 id（宿主模块加载器的 id 字段；工厂本身不写包裹层，仅作常量）。 */
     const MODULE_ID = 'dsh-active-sessions/sidebar'
     const CSS_TAG = PLUGIN_ID + '/sidebar.css'
@@ -132,6 +147,7 @@ window.__ModuleLoader__.load({
       OVERLAY_GAP,
       OVERLAY_TOP_FALLBACK,
       SELECT_EVENT,
+      NAVIGATION_EVENT,
       CSS_TAG,
     }
 
@@ -673,12 +689,300 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* ──────────────────── unseen 时间筛选（问题二） ──────────────────── */
+
+    /**
+     * 读「已完成未查看」的时间筛选。默认 **'recent' = 最近 7 天**（用户 2026-10-06 决策）。
+     *
+     * 为什么默认收窄：实测本机服务端「有史以来」口径下 unseen 有 484 条
+     * （0-7 天 115 / 7-30 天 236 / 30-180 天 125 / 180 天以上 8），一屏根本看不过来，
+     * 而用户真正关心的是「刚做完没看的那几件事」。
+     *
+     * 为什么筛选放在**客户端**而不是服务端：
+     *   1) 服务端仍返回全量 unseen，「切到全部」才不需要重扫（506 个投影文件约 1 秒）；
+     *   2) counts 是全量口径的统计值，若在服务端过滤，counts.unseen 会与列表长度对不上，
+     *      反而制造新的不一致（验收第 2 条要求计数可对账）；
+     *   3) 筛选是**这一屏的阅读偏好**，不是数据事实 —— 放 localStorage 刷新后还在，换机器不跟随。
+     */
+    function readUnseenFilter() {
+      try {
+        if (typeof localStorage === 'undefined' || localStorage === null) return 'recent'
+        const raw = localStorage.getItem(UNSEEN_FILTER_KEY)
+        return raw === 'all' ? 'all' : 'recent'
+      } catch (cause) {
+        warnOnce('readUnseenFilter', 'localStorage 不可读，按默认「最近 7 天」处理：' + describeError(cause))
+        return 'recent'
+      }
+    }
+
+    /** 写 unseen 筛选。任何非 'all' 的值都归一成 'recent'（默认档）。 */
+    function writeUnseenFilter(filter) {
+      const next = filter === 'all' ? 'all' : 'recent'
+      try {
+        if (typeof localStorage !== 'undefined' && localStorage !== null) {
+          localStorage.setItem(UNSEEN_FILTER_KEY, next)
+        }
+      } catch (cause) {
+        warnOnce('writeUnseenFilter', 'localStorage 不可写，本次筛选不持久化：' + describeError(cause))
+      }
+      return next
+    }
+
+    /**
+     * 按筛选把 unseen 条目切成「显示 / 隐藏」。
+     *
+     * 时间基准是 **lastPromptAt**（用户最后一次提问的时刻），不是 generatedAt、也不是投影 createdAt：
+     * unseen 的语义是「已完成但你没看」，用户关心的是「我什么时候做的」，
+     * lastPromptAt 正是那一刻。边界用严格大于（> cutoff）：恰好 7 天整的点算「更早」。
+     *
+     * @param {Array} entries 全部 unseen 条目
+     * @param {'recent'|'all'} filter
+     * @param {number} now 注入的时间源（单测可冻结）
+     * @returns {{visible: Array, hidden: number, cutoff: number}}
+     */
+    function partitionUnseen(entries, filter, now) {
+      const list = Array.isArray(entries) ? entries : []
+      const at = num(now)
+      if (filter === 'all') return { visible: list.slice(), hidden: 0, cutoff: 0 }
+      const cutoff = at - UNSEEN_RECENT_DAYS * 24 * 3600 * 1000
+      const visible = []
+      let hidden = 0
+      for (const entry of list) {
+        const at2 = asRecord(entry) === null ? 0 : num(entry.lastPromptAt)
+        if (at2 > cutoff) visible.push(entry)
+        else hidden += 1
+      }
+      return { visible: visible, hidden: hidden, cutoff: cutoff }
+    }
+
+    /**
+     * 批量「全部标记已读」。
+     *
+     * 为什么走**一条** POST（{sessionIds:[...]}）而不是逐条：
+     * 实测过滤后仍有 115~484 条，逐条意味着一次点击打出上百个请求，中途断连就留下半清不清的列表。
+     * 服务端复用同一条 /seen 路由（rpc.js 的批量分支），既不新增路由（冻结契约只有 4 条），
+     * 水位语义也与单条完全一致（取 max、只前进不后退）。
+     *
+     * @param {string[]} ids 当前筛选范围内的会话 id
+     * @param {{endpoint?:string, fetch?:Function}} [options] 测试注入
+     * @returns {Promise<{ok:boolean, applied:number, errorCode?:string}>}
+     */
+    function markAllSeen(ids, options) {
+      const list = Array.isArray(ids) ? ids.filter((x) => typeof x === 'string' && x !== '') : []
+      if (list.length === 0) return Promise.resolve({ ok: true, applied: 0 })
+      const config = asRecord(options) === null ? {} : options
+      const endpoint = str(config.endpoint) !== '' ? str(config.endpoint) : SEEN_ENDPOINT
+      const doFetch = config.fetch === undefined ? (typeof fetch === 'function' ? fetch : null) : config.fetch
+      if (typeof doFetch !== 'function') {
+        warnOnce('markAllSeen:noFetch', '没有可用的 fetch，批量标记已读未发出')
+        return Promise.resolve({ ok: false, applied: 0, errorCode: 'NO_FETCH' })
+      }
+      let body
+      try {
+        body = JSON.stringify({ sessionIds: list, at: Date.now() })
+      } catch (cause) {
+        warnOnce('markAllSeen:body', '构造批量请求体失败（跳过本次标记）：' + describeError(cause))
+        return Promise.resolve({ ok: false, applied: 0, errorCode: 'BODY_SERIALIZE_FAILED' })
+      }
+      // 一次性打上百个 id 可能超出 body 上限；超限时明确报错而不是静默截断。
+      if (body.length > 60000) {
+        warnOnce('markAllSeen:tooLarge', '批量标记已读超出请求体上限（' + String(body.length) + ' 字符），请改用更小的筛选范围')
+        return Promise.resolve({ ok: false, applied: 0, errorCode: 'PAYLOAD_TOO_LARGE' })
+      }
+      let promise
+      try {
+        promise = doFetch(endpoint, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: body,
+          keepalive: true,
+        })
+      } catch (cause) {
+        warnOnce('markAllSeen:call', '批量标记已读调用失败：' + describeError(cause))
+        return Promise.resolve({ ok: false, applied: 0, errorCode: 'FETCH_THREW' })
+      }
+      return Promise.resolve(promise).then(
+        (res) => {
+          if (res === null || res === undefined || res.ok === false) {
+            warnOnce('markAllSeen:http', '批量标记已读返回非 2xx')
+            return { ok: false, applied: 0, errorCode: 'HTTP_FAILED' }
+          }
+          return res.json().then(
+            (payload) => {
+              const outer = asRecord(payload)
+              const data = asRecord(outer === null ? null : outer.data)
+              return { ok: true, applied: num(data === null ? 0 : data.applied) }
+            },
+            (cause) => {
+              warnOnce('markAllSeen:json', '批量标记已读响应不是 JSON：' + describeError(cause))
+              return { ok: true, applied: 0 }
+            },
+          )
+        },
+        (cause) => {
+          warnOnce('markAllSeen:reject', '批量标记已读未完成（下轮轮询会重算）：' + describeError(cause))
+          return { ok: false, applied: 0, errorCode: 'REJECTED' }
+        },
+      )
+    }
+
+    /* ──────────────────── 宿主会话跳转面（问题三） ──────────────────── */
+
+    /**
+     * uiWorkspace 服务（宿主跨插件动作面）。
+     *
+     * 2026-10-06 实测根因：selectEntry 只 dispatchEvent('dsh-active-sessions:select')，
+     * 而**全仓库没有任何监听者** → 点击卡片毫无反应。
+     *
+     * 宿主的正确入口（官方侧栏就是这么用的，见
+     * @deepseek-ai/dsh-client-ui-sidebar/lib/client.js:329-339）：
+     *   inject 里含 'uiWorkspace'，apply 里 const workspaceNavigation = ctx.get('uiWorkspace')
+     *   然后 workspaceNavigation.openSession(sessionId)
+     * openSession 内部 = sessions.open(id) + ctx.layout.selectPanel(null)。
+     *
+     * 为什么**不**把 'uiWorkspace' 加进本包的 inject（结论：可选获取 + 缺失降级）：
+     *   cordis 的 ctx.get(name) 在服务缺席时返回 **undefined**（cordis/lib/index.js:762-764
+     *   get(name, strict) { return getTraceable(this.ctx, this._getImpl(name, strict)?.value) }），
+     *   所以「可选获取 + 缺失降级」是**安全**的；
+     *   而 inject 是硬依赖：服务没被 provide 时整个 fiber 停在 pending，四个挂载点全部注册不上，
+     *   面板直接消失。本包是独立 sideload 的客户端包，宿主换版本/换 platform（web vs 非 web）时
+     *   ui-workspace bundle 未必在，白拿一个「整包不加载」的风险不值得。
+     *   与 models.js 用 ctx.get('llm') 同理（官方有 11 处先例，均不进 inject）。
+     */
+    let workspaceFace = null
+
+    /**
+     * 惰性解析器：apply 时只记住 ctx，**每次点击时**再向宿主要 uiWorkspace。
+     *
+     * ⚠️ 2026-10-07 实测根因（浏览器真机验收发现的真 bug）：
+     *   原实现在 apply() 里一次性 `ctx.get('uiWorkspace')` 并缓存。但 cordis 的
+     *   `get(name, strict = true)` 在**提供者 fiber 尚未激活**时返回 undefined：
+     *       _getImpl(name, strict) { if (strict && impl.fiber.state !== 2) return; ... }
+     *   本包是 sideload 客户端包，inject 只有 ['slots','layout']，**不含 uiWorkspace**
+     *   （刻意不加：inject 是硬依赖，缺了会让整包 pending、四个挂载点全注册不上）。
+     *   于是 apply() 跑得比 ui-workspace 的 fiber 激活更早 → 拿到 undefined 并永久缓存，
+     *   点击时走 "UIWORKSPACE_MISSING" 分支 —— 而 selectEntry 的返回值**无人消费**，
+     *   失败完全静默：用户点卡片毫无反应，控制台也没有任何告警。
+     *
+     * 修法：把「取服务」推迟到点击那一刻（那时所有 fiber 早已激活），
+     * 并且只在成功时缓存；未取到时下次点击重试，不会把一次过早的 undefined 永久固化。
+     */
+    let workspaceResolver = null
+
+    /**
+     * 记下解析器（apply 时传入一个返回 uiWorkspace 或 null 的闭包）。
+     * 兼容旧签名：传一个非函数对象视为「直接绑定该 face」。
+     */
+    function bindWorkspaceFace(faceOrResolver) {
+      if (typeof faceOrResolver === 'function') {
+        workspaceResolver = faceOrResolver
+        return
+      }
+      workspaceResolver = null
+      workspaceFace = asRecord(faceOrResolver) === null ? null : faceOrResolver
+    }
+
+    /**
+     * 取当前可用的 uiWorkspace。
+     * 优先用惰性解析器（点击时实名求值），成功即缓存；失败不缓存，下次再试。
+     * @returns {object|null}
+     */
+    function resolveWorkspaceFace() {
+      if (workspaceFace !== null) return workspaceFace
+      if (workspaceResolver === null) return null
+      let face = null
+      try {
+        face = workspaceResolver()
+      } catch (cause) {
+        // 解析器抛错不该影响点击：降级为「无跳转面」，但必须留痕可诊断。
+        if (typeof console !== 'undefined' && console !== null && typeof console.warn === 'function') {
+          console.warn('[active-sessions/sidebar] 解析 uiWorkspace 失败: ' + describeError(cause))
+        }
+        return null
+      }
+      const normalized = asRecord(face) === null ? null : face
+      if (normalized !== null) workspaceFace = normalized
+      return normalized
+    }
+
+    /** 清空缓存（供自测在两次场景间复位）。 */
+    function resetWorkspaceFace() {
+      workspaceFace = null
+      workspaceResolver = null
+    }
+
+    /** 当前是否已绑定可用的跳转面（供自测断言降级路径）。 */
+    function hasWorkspaceFace() {
+      return workspaceFace !== null
+    }
+
+    /**
+     * 会话 id 形态归一：宿主 sessions.select() 只认它自己目录里的写法，
+     * 写错会直接抛 "sessions.select: unknown session &lt;id&gt;"。
+     *
+     * 实测本机两种写法都真实存在：
+     *   - workspace.json 的 sessionIds：379 条里 372 条带 'session-' 前缀，7 条是裸 uuid；
+     *   - 投影文件名：老会话裸 uuid，新会话带前缀（506 个文件两种都有）。
+     * 所以先按调用方给的原样试一次，失败再试另一种形态。
+     */
+    function sessionIdForms(id) {
+      const text = str(id)
+      if (text === '') return []
+      const bare = text.indexOf('session-') === 0 ? text.slice('session-'.length) : text
+      const forms = [text]
+      if (bare !== '' && bare !== text) forms.push(bare)
+      if (text.indexOf('session-') !== 0) forms.push('session-' + text)
+      return forms
+    }
+
+    /**
+     * 真正跳转到宿主会话。
+     *
+     * @returns {{opened:boolean, reason?:string, errorCode?:string}}
+     *   opened=false 时 reason 是可诊断的一行文案（界面会把它显示成一条提示条）。
+     *
+     * 覆盖子代理会话：宿主的 sessions.select() 支持 catalog-addressed child
+     * （dsh-api-session-controller/lib/client.js:2257-2261 会先 navigationAddress() 再按目录选），
+     * 所以子代理会话也是一等可打开对象，我们不预先拦它；但它可能不在当前已发现的目录里，
+     * 此时 select() 会抛 —— 已由下面的 try/catch 降级，绝不崩。
+     */
+    function openSessionInHost(id) {
+      // 点击那一刻才向宿主要服务 —— 见 resolveWorkspaceFace 上方的实测根因说明。
+      const face = resolveWorkspaceFace()
+      if (face === null) {
+        return { opened: false, reason: '宿主未提供 uiWorkspace 服务（跳转到会话不可用）', errorCode: 'UIWORKSPACE_MISSING' }
+      }
+      if (typeof face.openSession !== 'function') {
+        return { opened: false, reason: 'uiWorkspace 缺少 openSession 方法', errorCode: 'UIWORKSPACE_NO_OPEN' }
+      }
+      const forms = sessionIdForms(id)
+      if (forms.length === 0) return { opened: false, reason: '会话 id 为空', errorCode: 'EMPTY_SESSION_ID' }
+      let lastError = null
+      for (let i = 0; i < forms.length; i += 1) {
+        try {
+          face.openSession(forms[i])
+          return { opened: true }
+        } catch (cause) {
+          lastError = cause
+        }
+      }
+      return {
+        opened: false,
+        reason: '打开会话失败：' + describeError(lastError),
+        errorCode: 'OPEN_SESSION_FAILED',
+      }
+    }
+
     /**
      * 选中某个会话时上报。
      * 不写死任何导航接口：优先调用集成方传入的 onSelect；否则派发自定义事件，
      * 让「谁负责切会话」自己去监听，客户端包之间保持解耦。
      *
      * 同时上报已读水位（见 reportSeen 的说明）—— 这是 unseen 状态能清掉的唯一途径。
+     *
+     * 2026-10-06（问题三）：在上述两条之外**新增** uiWorkspace.openSession 跳转。
+     * 顺序刻意是「先跳转、后派发」：导航是用户点击的主要期望，派发只是向后兼容的旁路。
+     * 跳转失败不阻断派发（向后兼容优先），但会返回 reason 让界面能给出可诊断提示。
      */
     function selectEntry(entry, onSelect) {
       if (entry !== null && entry !== undefined) {
@@ -686,13 +990,30 @@ window.__ModuleLoader__.load({
         const seenOptions = typeof onSelect === 'object' && onSelect !== null ? onSelect : undefined
         void reportSeen(entry.id, seenOptions).catch(() => false)
       }
+      let nav = { opened: false, reason: '由外部 onSelect 接管导航', errorCode: 'ONSELECT_TAKEOVER' }
+      // onSelect 是集成方自己的导航通道（老契约："不写死任何导航接口"）。
+      // 它在场时**不**再去抢宿主跳转 —— 否则一次点击会触发两套导航，互相打架。
+      if (typeof onSelect !== 'function' && entry !== null && entry !== undefined) {
+        nav = openSessionInHost(entry.id)
+      }
+      // ⚠️ 2026-10-07：原实现把 nav 只当返回值——而**没有任何调用方消费它**，
+      // 于是「跳转失败」在界面上完全不可见（真机验收时点卡片毫无反应、控制台也无告警）。
+      // 跳转失败必须显式暴露，否则用户只会以为插件坏了却无从反馈。
+      // 注意：成功时**不**派发任何提示（避免每次点击都闪一条）。
+      if (nav.opened !== true && typeof window !== 'undefined' && window !== null &&
+          typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+        window.dispatchEvent(new CustomEvent(NAVIGATION_EVENT, {
+          detail: { id: entry === null || entry === undefined ? '' : entry.id, opened: false, reason: nav.reason, errorCode: nav.errorCode },
+        }))
+      }
       if (typeof onSelect === 'function') {
         onSelect(entry.id, entry)
-        return
+        return nav
       }
-      if (typeof window === 'undefined' || window === null) return
-      if (typeof window.dispatchEvent !== 'function' || typeof CustomEvent !== 'function') return
+      if (typeof window === 'undefined' || window === null) return nav
+      if (typeof window.dispatchEvent !== 'function' || typeof CustomEvent !== 'function') return nav
       window.dispatchEvent(new CustomEvent(SELECT_EVENT, { detail: { id: entry.id, cwd: entry.cwd, workspace: entry.workspace } }))
+      return nav
     }
 
     // ───────────────────────── 样式 ─────────────────────────
@@ -724,6 +1045,19 @@ window.__ModuleLoader__.load({
       '.as_foldBtn{width:100%;text-align:left;border:1px dashed var(--as-line);background:transparent;',
       'color:var(--as-tertiary);font-size:11.5px;padding:5px 8px;border-radius:8px;cursor:pointer;font-family:inherit}',
       '.as_foldBtn:hover{background:var(--as-card);color:var(--as-text2)}',
+    // ── 问题二：unseen 时间筛选条 ─────────────────────────────────────────
+    // 同样刻意只用半透明实色（as-card），不加任何背景模糊（列容器硬约束，见文件头）。
+    // ⚠️ 本文件对该 CSS 属性名的 grep 必须是 0 命中，**注释里也不要写它**，否则验收脚本会误判。
+    '.as_filterBar{display:flex;align-items:center;gap:4px;flex-wrap:wrap;padding:4px 6px;',
+    'border-top:1px solid var(--as-line);border-bottom:1px solid var(--as-line);background:var(--as-card)}',
+    '.as_filterLabel{font-size:11.5px;color:var(--as-tertiary);white-space:nowrap}',
+    '.as_filterBtn{font:inherit;font-size:11px;line-height:1.4;padding:3px 7px;border-radius:7px;cursor:pointer;',
+    'border:1px solid var(--as-line);background:transparent;color:var(--as-text2);white-space:nowrap}',
+    '.as_filterBtn:hover{background:var(--as-accent-bg);color:var(--as-text)}',
+    '.as_filterBtn_on{background:var(--as-accent-bg);border-color:var(--as-accent-line);color:var(--as-accent);font-weight:600}',
+    '.as_filterBtn_action{border-color:var(--as-accent-line);color:var(--as-accent)}',
+    '.as_filterBtn_action[disabled]{opacity:.55;cursor:progress}',
+    '.as_filterHint{padding:3px 8px;font-size:11px;color:var(--as-tertiary)}',
       // ── overlay 挂载形态（shell.overlay）──────────────────────────────
       // shell.overlay 是 absolute/inset:0/pointer-events:none 的帧级浮层（点击穿透），
       // 里面的元素必须自己 opt-in pointer-events:auto，否则整窗点不动。
@@ -820,6 +1154,13 @@ window.__ModuleLoader__.load({
       '.as_iconBtn_on{color:var(--as-accent);border-color:var(--as-accent-line);background:var(--as-accent-bg)}',
       '.as_warn{padding:6px 12px;font-size:11px;color:var(--as-appr);background:var(--as-appr-bg);',
       'border-bottom:1px solid var(--as-line)}',
+      // 说明性提示的折叠块（2026-10-07）：默认收起 → 只占一行，不再常驻刷屏。
+      '.as_warnNotes{padding:6px 12px;font-size:11px;color:var(--as-tertiary);',
+      'border-bottom:1px dashed var(--as-line);cursor:pointer}',
+      '.as_warnNotes_summary{outline:none;user-select:none}',
+      '.as_warnNotes_summary:hover{color:var(--as-text2)}',
+      '.as_warnNotes_list{margin:6px 0 2px;padding-left:16px;display:flex;flex-direction:column;gap:3px}',
+      '.as_warnNotes_item{line-height:16px;word-break:break-word}',
       '.as_body{flex:1;min-height:0;overflow:auto;padding:10px}',
       '.as_group{margin-bottom:11px}',
       '.as_group:last-child{margin-bottom:2px}',
@@ -1203,30 +1544,188 @@ window.__ModuleLoader__.load({
         )
       }
 
-      /** 非致命提示条（端点未就绪、服务端 warnings 等）。 */
+      // -------------------------------------------------------------------------
+      // 警告的「预期 vs 故障」判定（2026-10-07，用户实测「左窗底部两条噪音」）
+      // -------------------------------------------------------------------------
+      // ⚠️ 左窗此前之所以逐条刷屏（用户截图里那两条），是因为服务端 states.js 产出的是
+      //   `[states] operation=… error_code=Error` 的 key=value 串，与总览页 warnLine 的
+      //   ' -> CODE:' 形态对不上 → 归类全部落空 → 一条条 push。
+      //   **根本修法在服务端**：states.js 的 describeError 现在产出同一形态，
+      //   并且带**真实** error_code（SESSION_LOG_MISSING / CWD_NOT_ABSOLUTE …），
+      //   前端据此区分「预期降级」与「真故障」，不再做字符串猜测。
+      //
+      // ⚠️ 本段与 ui/overview.js 的同名实现**逐字一致**。两个 UI 是分别内联进 client.js 的
+      //   独立工厂（DSH 客户端 require 不了同包子路径），所以只能各写一份；
+      //   tests/temp-e2e-warning-groups.mjs 对两份实现跑同一组夹具并断言输出一致，
+      //   防止「改了一边忘了另一边」。
+      // -------------------------------------------------------------------------
+
+      /**
+       * 解析服务端诊断串的**规范格式**：
+       *     [operation] target -> ERROR_CODE: message {contextJson}
+       *
+       * 为什么不用一条正则：message 里可能含花括号，惰性分组会把 message 截断、
+       * 并把 message 的一段误当成 context。改成**从右往左**找可 JSON.parse 的尾段 ——
+       * context 永远是最后一段且必然是合法 JSON，判定无歧义且确定。
+       * 解析不出返回 null，调用方按「无法证明是预期行为」处理（fail-safe：宁可多显示）。
+       */
+      function parseWarningLine(raw) {
+        const text = str(raw)
+        if (text === '') return null
+        const head = text.match(/^\[([^\]]*)\]\s*([\s\S]*)$/)
+        if (head === null || head === undefined) return null
+        const operation = str(head[1])
+        const rest = str(head[2])
+
+        // target 与 CODE 之间用 ' -> ' 分隔；取**最后一个**，避免路径里的箭头串位。
+        const arrow = rest.lastIndexOf(' -> ')
+        if (arrow <= 0) return null
+        const target = rest.slice(0, arrow).trim()
+        const tail = rest.slice(arrow + 4).trim()
+
+        const codeMatch = tail.match(/^([A-Za-z0-9_]+)\s*([\s\S]*)$/)
+        if (codeMatch === null || codeMatch === undefined) return null
+        const code = str(codeMatch[1])
+        let body = str(codeMatch[2]).trim()
+        if (body.startsWith(':')) body = body.slice(1).trim()
+
+        let context = ''
+        let message = body
+        for (let i = body.lastIndexOf('{'); i >= 0; i = body.lastIndexOf('{', i - 1)) {
+          if (i <= 0) break
+          try {
+            const parsed = JSON.parse(body.slice(i))
+            if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              context = body.slice(i)
+              message = body.slice(0, i).trim()
+              break
+            }
+          } catch {
+            /* 不是合法 JSON 尾段，继续往左找 */
+          }
+        }
+        return { operation, target, code, message, context, raw: text }
+      }
+
       /**
        * 把服务端诊断串压缩成一句话摘要（完整串留给 title）。
-       * 诊断串形如：
-       *   [states] operation=校验会话 cwd target=/... input_summary=2 个会话的 cwd 不是
-       *   POSIX 绝对路径 error_code=Error message=非绝对 cwd 已降级为空工作区
-       * 取其中的 input_summary / message 段即可表达"发生了什么"。
+       * 规范格式下直接取 message 段表达「发生了什么」；
+       * 解析不出（历史 key=value 串 / 非本插件产出）时回落到旧的 key=value 抽取。
        */
       function summarizeWarning(raw) {
         const text = str(raw)
         if (text === '') return '有一条非致命提示（悬停查看详情）'
-        // 优先取 message=（最贴近人话），其次 input_summary=。
+        const parsed = parseWarningLine(text)
+        if (parsed !== null && parsed.message !== '') {
+          return parsed.message.length > 60 ? parsed.message.slice(0, 60) + '…' : parsed.message
+        }
+        // 兜底一：规范格式但没有 message 段 → 用 CODE + target 表达
+        if (parsed !== null) {
+          const fb = (parsed.code === '' ? '' : parsed.code) + (parsed.target === '' ? '' : ' ' + parsed.target)
+          if (fb !== '') return fb.length > 60 ? fb.slice(0, 60) + '…' : fb
+        }
+        // 兜底二：历史 key=value 形态（保留仅为向后兼容，**不作为预期/故障判定依据**）
         const pick = (key) => {
           const m = text.match(new RegExp(key + '=([^]*?)(?=\\s+[a-z_]+=|$)'))
           return m !== null && m !== undefined ? str(m[1]).trim() : ''
         }
         const msg = pick('message') || pick('input_summary')
         if (msg !== '') return msg.length > 60 ? msg.slice(0, 60) + '…' : msg
-        // 兜底：整串截断。
+        // 兜底三：整串截断。
         return text.length > 60 ? text.slice(0, 60) + '…' : text
       }
 
+    /**
+     * 预期行为（非故障）的 error_code → 合并文案。
+     *
+     * ⚠️ 这张表覆盖了服务端**全部**设计内降级码（states.js + overview.js 两个产出方），
+     * 逐条列全是有意的：漏一个码，那类降级就会以「真故障」的姿态常驻刷屏 ——
+     * 这正是本次用户投诉的现象（2026-10-07 真机 e2e 就抓到漏网的
+     * EXCERPT_BUDGET_EXHAUSTED）。新增降级码时必须同步登记到这张表。
+     *
+     * 判定口径只有一条：**这是插件为了保护宿主/自己主动做的让步吗？**
+     *   是 → 预期（折叠，不常驻打扰）
+     *   否 → 故障（常驻可见）—— 包括读不到、解析失败、llm 不可用、生成失败。
+     *
+     * 顺序即展示顺序，是这张表的数组顺序（不是对象枚举顺序）—— 保证确定性。
+     */
+    const EXPECTED_WARNING_GROUPS = [
+      // ── 总览页（src/overview.js）：扫描/摘录的上限保护 ──
+      { code: 'WORKSPACE_TRUNCATED', label: (n) => n + ' 个工作区的笔记已截断（文件数/体积超限）' },
+      { code: 'FILE_TOO_LARGE', label: (n) => n + ' 个超大文件已被跳过（单文件超过体积上限）' },
+      { code: 'ENTRY_BUDGET_EXCEEDED', label: (n) => n + ' 处目录扫描触达条目上限，子目录未继续深入' },
+      { code: 'EXCERPT_BUDGET_EXHAUSTED', label: (n) => n + ' 处笔记摘录预算用尽（超出的文件只列路径）' },
+      { code: 'SESSION_SCAN_CAPPED', label: (n) => n + ' 处会话扫描达到文件数上限（更早的会话未纳入）' },
+      // ── cwd 归一化（overview.js 与 states.js 共用同一码，因此两边合并成一条）──
+      { code: 'CWD_NOT_ABSOLUTE', label: (n) => n + ' 个会话/目录的 cwd 不是绝对路径，已降级' },
+      { code: 'CWD_NOT_ABSOLUTE_MANY', label: (n) => n + ' 条非绝对路径已全部丢弃' },
+      // ── 三态扫描（src/states.js）──
+      { code: 'SESSION_LOG_MISSING', label: (n) => n + ' 个会话没有可读的会话日志，已按「不判活」处理' },
+      { code: 'DUPLICATE_SESSION_ID', label: (n) => n + ' 条重复的会话投影已去重' },
+      // ── 生成路径（src/index.js）：省 token 的设计内复用 ──
+      { code: 'NOTE_CACHE_REUSED', label: (n) => n + ' 处复用了上次生成结果（笔记未变化，未调用模型）' },
+      { code: 'NOTE_PERSISTED_REUSED', label: (n) => n + ' 处复用了已落盘的总结（笔记指纹一致，未调用模型）' },
+      // ── 生成路径（src/index.js）：没有笔记就没有可总结的内容 ──
+      // ⚠️ 2026-10-07 新增。跳过空工作区是**主动省钱**的设计内让步（实测 21 个工作区里
+      //    8 个是 0 文件，旧实现照样发起模型调用、只能回「摘录不足以判断」），
+      //    不是故障。漏登记这一条，它就会以「真故障」的姿态常驻刷屏 —— 上一轮刚踩过这个坑。
+      { code: 'EMPTY_WORKSPACE_SKIPPED', label: (n) => n + ' 个工作区没有笔记类文件，已跳过生成（未调用模型）' },
+    ];
+
       /**
-       * 非致命提示条。
+       * 把服务端 warnings 折成「故障（常驻）」与「说明（折叠）」两堆。
+       *
+       * 预期项 → 折叠成一行「N 项说明性提示」，默认收起、不常驻；
+       * 真故障 → 与之前一致地常驻可见，绝不折叠、绝不丢弃。
+       * 顺序：先按判定表序输出合并项，再按原始数组下标序输出未合并单条 → 同输入必同输出。
+       */
+      function classifyWarnings(warnings) {
+        const list = (Array.isArray(warnings) ? warnings : []).map(str).filter((text) => text !== '')
+        const info = list.map(parseWarningLine)
+        const expectedCodes = EXPECTED_WARNING_GROUPS.map((g) => g.code)
+        const used = []
+        for (let i = 0; i < list.length; i += 1) used.push(false)
+        const faults = []
+        const notes = []
+
+        for (const group of EXPECTED_WARNING_GROUPS) {
+          const members = []
+          for (let i = 0; i < info.length; i += 1) {
+            if (used[i] === true) continue
+            if (info[i] !== null && info[i].code === group.code) {
+              members.push(i)
+              used[i] = true
+            }
+          }
+          if (members.length === 0) continue
+          notes.push({
+            key: 'we:' + group.code,
+            text: group.label(members.length),
+            detail: members.map((i) => list[i]).join('\n'),
+            count: members.length,
+            grouped: true,
+          })
+        }
+
+        for (let i = 0; i < list.length; i += 1) {
+          if (used[i] === true) continue
+          const parsed = info[i]
+          const isExpected = parsed !== null && expectedCodes.indexOf(parsed.code) !== -1
+          const item = {
+            key: 'w:' + i,
+            text: summarizeWarning(list[i]),
+            detail: list[i],
+            count: 1,
+            grouped: false,
+          }
+          if (isExpected) notes.push(item)
+          else faults.push(item)
+        }
+        return { faults, notes }
+      }
+
+      /** 非致命提示条（端点未就绪、服务端 faults 等）。 */
+      /**
        * text 是**给人看的一句话摘要**；detail 是完整诊断串，只放在 title 里悬停可见。
        * 这样警告不会因为太长而挤占会话列表空间。
        */
@@ -1236,6 +1735,25 @@ window.__ModuleLoader__.load({
           role: 'status',
           title: typeof props.detail === 'string' && props.detail.length > 0 ? props.detail : undefined,
         }, props.text)
+      }
+
+      /**
+       * 说明性提示的**折叠块**（2026-10-07）。默认收起 → 界面上只常驻一行标题；
+       * 展开后逐条显示、悬停还能看到完整原串。「不常驻打扰」与「不丢信息」同时满足。
+       * 与 ui/overview.js 的 NoticeNotes 语义逐字一致（两个工厂各有一份实现）。
+       */
+      function WarnNotes(props) {
+        const items = Array.isArray(props.items) ? props.items : []
+        const count = items.reduce((sum, item) => sum + (typeof item.count === 'number' ? item.count : 1), 0)
+        const detail = items
+          .map((item) => (item.grouped === true ? item.text + '\n' + item.detail : item.detail))
+          .join('\n')
+        return el('details', { className: 'as_warnNotes', title: detail },
+          el('summary', { className: 'as_warnNotes_summary' }, '说明性提示（' + String(count) + ' 项，点击展开查看）'),
+          el('ul', { className: 'as_warnNotes_list' },
+            items.map((item) => el('li', { className: 'as_warnNotes_item', key: item.key, title: item.detail }, item.text)),
+          ),
+        )
       }
 
       /** 空态：加载中 / 无数据 / 端点暂不可用 —— 三种都只显示文案，不报错。 */
@@ -1401,14 +1919,78 @@ window.__ModuleLoader__.load({
         // 否则两层各自 readCollapsed，会出现「点了收起但外层仍画长窗」的矛盾。
         const isCollapsed = config.forceExpanded === true ? false : collapsed
 
+        // 问题二：「已完成未查看」的时间筛选（默认最近 7 天，可切全部）。
+        // 只影响 unseen 这一组；running / approval 永远全量显示（它们本来就是「当下」的事）。
+        const filterState = React.useState(readUnseenFilter)
+        const unseenFilter = filterState[0]
+        const setUnseenFilter = filterState[1]
+        // 批量标记已读的结果提示（成功/失败都要有一行可诊断文案，不能静默）。
+        const [markNotice, setMarkNotice] = React.useState(null)
+        const [marking, setMarking] = React.useState(false)
+        // 跳转失败提示（2026-10-07）：selectEntry 的返回值无人消费，失败必须显式冒泡到这里，
+        // 否则用户点卡片没反应却看不到任何原因（真机验收实测的静默失效）。
+        const [navNotice, setNavNotice] = React.useState(null)
+        React.useEffect(() => {
+          function onNavFailed(event) {
+            const detail = event !== null && event !== undefined ? event.detail : null
+            if (detail === null || detail === undefined) return
+            setNavNotice({
+              errorCode: detail.errorCode !== undefined ? detail.errorCode : 'NAVIGATION_FAILED',
+              text: '跳转到该会话失败（' + String(detail.errorCode !== undefined ? detail.errorCode : 'NAVIGATION_FAILED') + '）：' + String(detail.reason !== undefined ? detail.reason : '未知原因'),
+            })
+          }
+          if (typeof window === 'undefined' || window === null || typeof window.addEventListener !== 'function') return undefined
+          window.addEventListener(NAVIGATION_EVENT, onNavFailed)
+          return () => { window.removeEventListener(NAVIGATION_EVENT, onNavFailed) }
+        }, [])
         const total = data.snapshot.counts.total
         const now = toPositive(config.now) > 0 ? toPositive(config.now) : Date.now()
-        const groups = groupByState(data.snapshot.entries)
+        // ⚠️ 必须**只把 unseen 交给 partitionUnseen**：它是纯时间筛选器，不认 state。
+        // 若把全量 entries（含 running/approval）喂进去，hidden 会把「运行中/待审批」
+        // 也算成「被时间筛掉的已完成会话」，提示语就会说谎（首版接线正是这么错的）。
+        // 切完再交给 groupByState：counts 是服务端全量口径，列表被筛过是正常的，
+        // 差异由下面那行「另有 N 条…」显式说明，而不是让用户以为数据丢了。
+        const allEntries = data.snapshot.entries
+        const unseenEntries = []
+        const entriesForList = []
+        for (const entry of allEntries) {
+          if (asRecord(entry) !== null && entry.state === 'unseen') unseenEntries.push(entry)
+          else entriesForList.push(entry)
+        }
+        const split = partitionUnseen(unseenEntries, unseenFilter, now)
+        const unseenVisible = split.visible
+        for (let i = 0; i < split.visible.length; i += 1) entriesForList.push(split.visible[i])
+        const groups = groupByState(entriesForList)
 
         const toggle = () => {
           const next = collapsed !== true
           setCollapsed(next)
           writeCollapsed(next)
+        }
+
+        // 切换筛选：写 localStorage + 立刻重渲染（不用等下一轮轮询）。
+        const switchFilter = (next) => {
+          const applied = writeUnseenFilter(next)
+          setUnseenFilter(applied)
+          setMarkNotice(null)
+        }
+
+        // 「全部标记已读」的作用范围必须与**当前筛选一致**：只看 7 天就只清 7 天。
+        // 按钮文案显式写出范围，避免用户以为清掉了全部。
+        const markAllVisibleSeen = () => {
+          if (marking === true) return
+          setMarking(true)
+          const ids = unseenVisible.map((entry) => str(entry.id)).filter((id) => id !== '')
+          markAllSeen(ids, { endpoint: str(config.seenEndpoint) !== '' ? config.seenEndpoint : undefined, fetch: config.fetch })
+            .then((result) => {
+              setMarking(false)
+              if (result.ok === true) {
+                setMarkNotice({ ok: true, text: '已标记 ' + String(result.applied) + ' 条为已读（范围：' + (unseenFilter === 'all' ? '全部' : '最近 ' + String(UNSEEN_RECENT_DAYS) + ' 天') + '）' })
+                if (typeof config.onRefresh === 'function') config.onRefresh()
+              } else {
+                setMarkNotice({ ok: false, text: '标记已读失败（error_code=' + String(result.errorCode) + '），可稍后重试' })
+              }
+            })
         }
 
         if (isCollapsed === true) return el(Pill, { total, onExpand: toggle })
@@ -1420,10 +2002,30 @@ window.__ModuleLoader__.load({
         }
         // 服务端 warnings 是**完整诊断串**（含 operation/target/error_code/context），
         // 实测单条就有 100+ 字符，直接铺在界面上会把面板占满、对用户是噪音。
-        // 这里只显示**一句话摘要**，完整串放进 title（鼠标悬停可见）——
-        // 既保持可诊断性，又不让警告挤占会话列表空间。
-        for (const warning of data.snapshot.warnings) {
-          notices.push(el(Warn, { key: 'warn:' + warning, text: summarizeWarning(warning), detail: warning }))
+        //
+        // 2026-10-07：此前这里是**无条件逐条 push**，用户截图里的两条
+        //（「这些会话没有可读的 session*.jsonl.zstd…」「非绝对 cwd 已降级…」）
+        // 就是这么来的 —— 它们是**预期降级**，不是故障。
+        // 现在按 classifyWarnings 分流：
+        //   · 预期项 → 收进默认收起的 <details>，界面上只常驻一行标题；
+        //   · 真故障 → 保持逐条常驻（摘要 + 完整串进 title），行为与之前一致。
+        // 与工作总览页（ui/overview.js）行为**完全一致**。
+        const classified = classifyWarnings(data.snapshot.warnings)
+        for (const fault of classified.faults) {
+          notices.push(el(Warn, { key: fault.key, text: fault.text, detail: fault.detail }))
+        }
+        if (classified.notes.length > 0) {
+          notices.push(el(WarnNotes, { key: 'as-notes', items: classified.notes }))
+        }
+        // 跳转失败提示（2026-10-07）：必须是**可见**的一条，不能只放进 console。
+        // 真机验收实测：点卡片毫无反应、控制台也无告警 —— 因为 selectEntry 的返回值没人消费。
+        // 现在由 NAVIGATION_EVENT 冒泡上来，这里渲染成与其它警告同款的提示条。
+        if (navNotice !== null) {
+          notices.push(el(Warn, {
+            key: 'nav-failed',
+            text: '跳转失败：' + String(navNotice.errorCode),
+            detail: 'operation=openSession target=uiWorkspace.openSession error_code=' + String(navNotice.errorCode) + ' | ' + String(navNotice.text),
+          }))
         }
 
         return el('aside', {
@@ -1447,12 +2049,126 @@ window.__ModuleLoader__.load({
             onToggleLock: typeof config.onToggleLock === 'function' ? config.onToggleLock : null,
           }),
           notices.length > 0 ? notices : null,
+          // 问题二：unseen 时间筛选 + 「全部标记已读」。
+          // 放在标题栏与列表之间（而不是塞进 unseen 分组标题）有两个原因：
+          //   1) 分组标题宽度只有 ~120px（「已完成未查看」6 个字已经占满），塞不下两个控件；
+          //   2) 控件是**跨分组**的设置（决定 unseen 这一组显示多少），放进分组标题里
+          //      会让人误以为它只作用于那个分组。
+          el('div', { className: 'as_filterBar' },
+            el('span', { className: 'as_filterLabel' }, '已完成未查看'),
+            el('button', {
+              type: 'button',
+              className: 'as_filterBtn' + (unseenFilter === 'recent' ? ' as_filterBtn_on' : ''),
+              'aria-pressed': unseenFilter === 'recent',
+              'data-as-unseen-filter': 'recent',
+              title: '只看最近 ' + String(UNSEEN_RECENT_DAYS) + ' 天做的会话',
+              onClick: () => { switchFilter('recent') },
+            }, '近 ' + String(UNSEEN_RECENT_DAYS) + ' 天'),
+            el('button', {
+              type: 'button',
+              className: 'as_filterBtn' + (unseenFilter === 'all' ? ' as_filterBtn_on' : ''),
+              'aria-pressed': unseenFilter === 'all',
+              'data-as-unseen-filter': 'all',
+              title: '显示有史以来全部已完成未查看的会话',
+              onClick: () => { switchFilter('all') },
+            }, '全部'),
+            unseenVisible.length > 0
+              ? el('button', {
+                  type: 'button',
+                  className: 'as_filterBtn as_filterBtn_action',
+                  'data-as-mark-all-seen': unseenFilter,
+                  disabled: marking === true,
+                  // 文案写清作用范围：只看 7 天就只清 7 天，不让用户以为清了全部。
+                  title: '把当前范围内 ' + String(unseenVisible.length) + ' 条已完成未查看的会话标记为已读（范围：' + (unseenFilter === 'all' ? '全部' : '最近 ' + String(UNSEEN_RECENT_DAYS) + ' 天') + '）',
+                  onClick: markAllVisibleSeen,
+                }, marking === true ? '标记中…' : '全部标记已读（' + String(unseenVisible.length) + '）')
+              : null,
+          ),
+          split.hidden > 0 && unseenFilter !== 'all'
+            ? el('div', { className: 'as_filterHint' }, '另有 ' + String(split.hidden) + ' 条超过 ' + String(UNSEEN_RECENT_DAYS) + ' 天的已完成会话，已折叠（切到「全部」可查看）')
+            : null,
+          markNotice !== null
+            ? el('div', {
+                className: 'as_warn',
+                role: 'status',
+                title: 'operation=markAllSeen target=' + str(config.seenEndpoint !== undefined ? config.seenEndpoint : SEEN_ENDPOINT) + ' error_code=' + (markNotice.ok === true ? 'NONE' : 'MARK_ALL_FAILED'),
+              }, markNotice.text)
+            : null,
           el('div', { className: 'as_body' },
             groups.length === 0
               ? el(Empty, { phase: data.phase })
               : groups.map((group) => el(Group, { key: group.key, group, onSelect: config.onSelect, now })),
           ),
         )
+      }
+
+      // ── Bug 3（2026-10-06，用户实测「点侧栏图标会抢走中间工作区」）────────────
+      // 背景（宿主契约，已读源码确认，**不要试图绕过**）：
+      //   1. dsh-client-ui-sidebar/lib/client.js 的 PanelRow，onClick **硬编码**
+      //      `selectPanel(id)`，插件没有任何拦截机会；
+      //   2. dsh-client-ui-layout 的 LayoutController.selectPanel：
+      //      `if (panelId !== null && !this.hasMainPanel(panelId)) throw` ——
+      //      所以 main 槽位**必须**保留注册，删掉就一点击就抛异常（旧代码注释写的正是这条）。
+      //
+      // 那 main 槽位该渲染什么？读 MainPanel 的实现可知：
+      //   renderSlot("main", {}, { entryKey: activePanelId ?? "conversation" })
+      // keyed 槽位**只渲染命中的那一个 entry**（dsh-client-ui-renderer L827-829）。
+      // 也就是说：只要 activePanelId 被设成 'active-sessions'，对话内容就一定被替换 ——
+      // 哪怕我们渲染 null，中间也只会剩下一个**空白**的中央列，用户仍然会觉得「被抢走了」。
+      //
+      // 所以修法是两件事一起做：
+      //   ① main 槽位注册一个**不渲染任何可见内容**的组件（不再画 .as_root 全屏列表）；
+      //   ② 它挂载时立刻 `layout.selectPanel(null)` 把 main 槽位**还给 conversation** ——
+      //      这才是真正做到「中间工作区保持原样」。
+      // 效果：点侧栏图标 → 浮层唤回 + 中间对话原封不动。
+      // ctx.layout 缺失时（极老宿主 / 单测桩）退化为「只唤回浮层、中间留空」，不会崩。
+      let layoutFace = null;
+
+      /** 记下宿主的跨插件动作面（apply 时从 ctx.layout 取）。 */
+      function bindLayoutFace(face) {
+        layoutFace = asRecord(face) === null ? null : face;
+      }
+
+      /**
+       * 把 main 槽位交还给 conversation（activePanelId -> null）。
+       * @returns {boolean} 是否真的交还了（false = 没有 layout 面 / 宿主抛错）
+       */
+      function handBackToConversation() {
+        const face = layoutFace;
+        if (face === null || face === undefined || typeof face.selectPanel !== 'function') {
+          return false;
+        }
+        try {
+          // selectPanel(null) 是宿主自己的「回到对话」语义（dsh-client-ui-workspace 也在用）。
+          face.selectPanel(null);
+          return true;
+        } catch (error) {
+          warnOnce('main:handBack', '交还 main 槽位失败（中间列可能留空）：' + describeError(error));
+          return false;
+        }
+      }
+
+      /**
+       * `main` 槽位的挂载体：**不渲染任何可见内容**，只负责「唤回浮层 + 交还中央列」。
+       *
+       * 为什么不是直接 `return null` 就完事：见上面 handBackToConversation 的注释 ——
+       * 渲染 null 只是把「全屏列表」换成「空白中央列」，对话一样回不来。
+       *
+       * 为什么不用 Component：Component 是给 sidebar.panellist 渲染紧凑 glyph 的，
+       * 且默认分支是 FullPane（.as_root 全屏）。复用它会重新引入 Bug 3，
+       * 也会破坏 panellist 的 glyph 渲染 —— 所以这里是一个**独立**组件。
+       */
+      function MainSlotHost() {
+        // ⚠️ hook 必须在任何 return 之前（与 Component 同一条纪律，见那里的注释）。
+        React.useEffect(() => {
+          // 唤回浮层：用户点侧栏「活跃会话」图标 = 「我想看活跃会话」。
+          // 这条机制原封不动地保留 —— 用户要的正是它。
+          writeCollapsed(false);
+          // 再把中央列还给对话，避免「点一下图标就把工作区内容弄没了」。
+          handBackToConversation();
+        }, []);
+        injectStyles();
+        return null;
       }
 
       /**
@@ -1744,9 +2460,28 @@ window.__ModuleLoader__.load({
           Component,
         ))
         // main 是 keyed 槽位：key 必须与上面的 id 完全一致，否则点击找不到目标。
+        // ⚠️ 注册的是 MainSlotHost 而不是 Component（Bug 3）：它不渲染任何可见内容，
+        // 挂载时唤回浮层并把中央列交还给对话。**绝不能删掉这条注册** ——
+        // 删掉后 LayoutController.selectPanel 会直接抛
+        // `main panel "active-sessions" is not registered`，一点击就崩。
+        bindLayoutFace(ctx.layout)
+      // 问题三：绑定宿主会话跳转面 —— **惰性**。
+      // 为什么用 ctx.get 而不是 inject：见 bindWorkspaceFace 上方的结论 ——
+      // ctx.get 服务缺席返回 undefined，天然可选；inject 缺席会让整个包停在 pending。
+      //
+      // ⚠️ 2026-10-07 真机验收实测：apply 时**不能**一次性取值并缓存。
+      //   cordis 的 get(name, strict=true) 在提供者 fiber.state !== 2（未激活）时返回 undefined，
+      //   而本包 apply 早于 ui-workspace 的 fiber 激活 → 永久缓存了 undefined → 点击静默失效。
+      //   改为把 ctx 交给解析器，点击那一刻再实名求值（届时所有 fiber 早已激活）。
+      bindWorkspaceFace(() => {
+        if (typeof ctx.get !== 'function') return null
+        // strict 显式传 false：拿「已注册但 fiber 正在切换」的实现也比拿不到强，
+        // 且我们已在点击路径上 try/catch，不会因服务瞬时不可用而崩。
+        return ctx.get('uiWorkspace', false) ?? null
+      });
         const disposeMain = ctx.slots.inject('main', () => ctx.slots.register(
           { name: 'main', key: PANEL_ID },
-          Component,
+          MainSlotHost,
         ))
 
         // shell.overlay：帧级浮层 —— 这是「左侧常驻长窗」的正确挂载点。
@@ -1776,6 +2511,7 @@ window.__ModuleLoader__.load({
 
       return {
         Component,
+        MainSlotHost,
         OverlayHost,
         PaneComponent: Component,
         apply,
@@ -1784,7 +2520,14 @@ window.__ModuleLoader__.load({
         // Pill 仍在列表里：槽位内嵌形态（Component / main 面板）的收起态继续用它，
         // 只有 overlay 形态不再渲染它。几何相关的纯函数一并导出，供自测直接单测。
         internals: {
-          Pill, GlyphPane, Head, Warn, Empty, Card, RelationLine, Cluster, Group, FullPane, useSnapshot, summarizeWarning,
+          Pill, GlyphPane, Head, Warn, WarnNotes, Empty, Card, RelationLine, Cluster, Group, FullPane, useSnapshot, summarizeWarning,
+          // 2026-10-07：警告的「预期 vs 故障」判定面（供单测与总览页对照）
+          parseWarningLine, classifyWarnings, EXPECTED_WARNING_GROUPS,
+          MainSlotHost, bindLayoutFace, handBackToConversation,
+          // 问题二 / 问题三 的可测面
+          readUnseenFilter, writeUnseenFilter, partitionUnseen, markAllSeen,
+          bindWorkspaceFace, hasWorkspaceFace, resolveWorkspaceFace, resetWorkspaceFace, openSessionInHost, selectEntry,
+          NAVIGATION_EVENT,
           measureOverlayTop, viewportHeight, maxOverlayHeight, defaultOverlayHeight,
           clampOverlayWidth, clampOverlayHeight, readOverlayGeometry, writeOverlayGeometry, readLocked, writeLocked,
           subscribeCollapsed, collapseSubscriberCount,
@@ -1794,8 +2537,15 @@ window.__ModuleLoader__.load({
 
     // ───────────── 模块级便捷导出（兼容 / 自测） ─────────────
 
-    /** 依赖声明：只依赖 slots，不注册任何模型可见工具（0 token 硬约束）。 */
-    const inject = ['slots']
+    /**
+     * 依赖声明：只依赖 slots + layout，**不注册任何模型可见工具**（0 token 硬约束）。
+     *
+     * ⚠️ 2026-10-06 新增 'layout'：Bug 3 的修法需要 `ctx.layout.selectPanel(null)`
+     * 把 main 槽位交还给对话。layout 是 dsh-client-ui-layout 通过 ctx.reflect.provide
+     * 暴露的跨插件动作面，官方侧栏自己也是 `inject = ["slots","layout",...]`。
+     * 缺了它 main 槽位只能渲染空白中央列（不崩，但用户仍会以为内容被抢走）。
+     */
+    const inject = ['slots', 'layout']
 
     let defaultUi = null
     /** 惰性单例：给模块级 apply / PaneComponent 用（React 走 globalThis 探测）。 */
@@ -1848,26 +2598,149 @@ window.__ModuleLoader__.load({
     /** 本插件自己的取数端点；契约 §4.2 的「localhost HTTP 端点」降级通道。 */
     const OVERVIEW_ENDPOINT = '/api/active-sessions/overview';
 
+    /**
+     * 「立即生成」的 POST 端点。
+     *
+     * ⚠️ 2026-10-06 修 Bug 1（用户实测 404）：客户端原先把 POST 也打到 OVERVIEW_ENDPOINT，
+     * 而服务端对那条路径只放行 GET/HEAD（rpc.js 的 METHODS 表），且路由表是**逐字节匹配**、
+     * 不做前缀/模糊匹配 → 稳定 404。用户看到的报错原文是
+     *   生成失败（operation=generateOverview target=/api/active-sessions/overview error_code=HTTP_404）。
+     * 这里刻意用**拼接**而不是另写一个字面量：拼接能保证它永远等于
+     * 「GET 端点 + /generate」，而 tests/temp-e2e-overview-404.mjs 负责断言
+     * 「客户端常量 === 服务端 rpc.js 的 ROUTES.overviewGenerate」，两侧再漂移就红。
+     */
+    const OVERVIEW_GENERATE_ENDPOINT = OVERVIEW_ENDPOINT + '/generate';
+
+    /**
+     * 隐藏名单切换端点（2026-10-07）。与服务端 rpc.js 的 ROUTES.overviewHidden 对应。
+     *
+     * ⚠️ 语义边界：这是**本插件总览页的显示控制**，不是 DSH 的工作区删除。
+     *   界面上的一切文案都必须守住这条线 —— 按钮写「隐藏」而不是「删除」，
+     *   确认框必须写明「DSH 的工作区与文件都不受影响」。
+     *   一旦用户以为删了 DSH 的工作区，他的侧栏/会话就会"莫名其妙少一个"，
+     *   而真相是本插件把它从这一页藏起来了 —— 那比不做功能更糟。
+     */
+    const OVERVIEW_HIDDEN_ENDPOINT = OVERVIEW_ENDPOINT + '/hidden';
+
+    /**
+     * 隐藏/恢复的二次确认文案（纯函数，导出到 internals 供单测直接断言）。
+     *
+     * 为什么必须把这句话写死并单独可测：它是本功能唯一的「语义说明书」。
+     * 按钮叫「隐藏」，用户第一反应仍可能是「删掉？」，
+     * 所以确认框里必须明确三件事：只影响本页 / DSH 数据不受影响 / 可以恢复。
+     */
+    function hiddenConfirmText(cwd, hide) {
+      return hide === true
+        ? '隐藏这个工作区？\n\n'
+          + '只从「工作总览」这一页隐藏它。DSH 的工作区、侧栏、会话记录与文件都不受影响，'
+          + '随时可以用工具栏的「已隐藏」入口恢复。\n\n'
+          + cwd
+        : '恢复这个工作区？它会重新出现在「工作总览」这一页。\n\n' + cwd;
+    }
+
     /** localStorage 键：自动开关 / 模型选择 / 上次生成的文件签名快照。 */
     const LS_AUTO = 'dsh-active-sessions.overview.auto';
     const LS_MODEL = 'dsh-active-sessions.overview.model';
     const LS_SIGNATURE = 'dsh-active-sessions.overview.signature';
 
+    // ---------------------------------------------------------------------------
+    // 模型下拉的数据源与「不可解析」防线（2026-10-07，用户实测 Bug：立即生成点了没内容）
+    // ---------------------------------------------------------------------------
+    //
+    // ⚠️ **这里曾有一份 PLACEHOLDER_MODELS 占位表，第一项是 'session-default'。**
+    //   它被当作 state.model 的初值，于是用户点「立即生成」时 POST 的 body 是
+    //     {"generate":true,"model":"session-default"}
+    //   而服务端 resolveModelRoute('session-default', catalog) 目录里查不到、串里也没有 '/'，
+    //   返回 null → 后端一个模型都没调 → 返回空 summaries（用户看到的「点了没内容」）。
+    //
+    // ⚠️ **「跟随会话默认模型」这条路根本不存在**（已核对 @deepseek-ai/dsh-llm 的
+    //   call-config.d.ts：`LlmCallConfig.provider` 与 `model` 都是必填 string，
+    //   GenerateOptions 里没有「不给 route 就用会话默认」的语义）。
+    //   所以占位表不是降级方案，是**死路**：删掉，改成「目录未就绪 = 没有可选项 =
+    //   按钮禁用 + 明确文案」，并让目录一到就自动纠正默认值。
+    //
+    // 目录来源不变：GET /api/active-sessions/overview 返回的 models 字段（rpc.js 里由
+    // models.js 经 ctx.get('llm') 取）。取不到就如实显示「模型服务不可用」，不编假模型。
+
+    /** 下拉的选项值：<provider>/<model>。裸 id 在跨 provider 同名时无法消歧。 */
+    function modelOptionValue(model) {
+      if (!isRecord(model)) return '';
+      const id = typeof model.id === 'string' ? model.id : '';
+      if (id === '') return '';
+      const provider = typeof model.provider === 'string' ? model.provider : '';
+      return provider === '' ? id : provider + '/' + id;
+    }
+
     /**
-     * 模型下拉的兜底列表。
+     * 前端版的 resolveModelRoute：**与 src/models.js 的同名函数同规则**，用于 POST 前预校验。
      *
-     * 选型说明（必读，已在交付报告中同步）：优先走服务端端点的 models 字段
-     * （GET /api/active-sessions/overview?models=1），因为那才是「DSH 既有模型来源」的
-     * 正确接法（服务端可读 settings.yaml / modelCatalog）。当端点未实现或不可达时，
-     * 退化为下面这份占位列表，并在界面上明确标注「占位」，避免用户以为它反映了真实配置。
-     * 之所以不直接调 ctx.remote.session.modelCatalog()：那需要注入 remote 服务，
-     * 而槽位注册契约里我们只声明了 slots；真正的目录接口应由主代理在集成层接。
+     * 规则（逐条对齐 models.js:92-108）：
+     *   1. 目录内按**裸 id**唯一命中 → 可解析（多 provider 同名 → 不猜，返回不可解析）；
+     *   2. 退化：形如 `provider/model` 的自描述形式（'/' 不在首尾）→ 可解析。
+     * 判不出来就返回 null，调用方**不得发 POST**（发了注定返回 NO_SUMMARIES）。
      */
-    const PLACEHOLDER_MODELS = [
-      { id: 'session-default', name: '跟随会话默认模型（占位）', provider: '' },
-      { id: 'moonshotai-cn/kimi-k2', name: 'moonshotai-cn / kimi-k2（占位）', provider: 'moonshotai-cn' },
-      { id: 'cool-cofee-gpt/gpt-5', name: 'cool-cofee-gpt / gpt-5（占位）', provider: 'cool-cofee-gpt' },
-    ];
+    function canResolveRoute(selected, models) {
+      const text = typeof selected === 'string' ? selected : '';
+      if (text === '') return null;
+      const list = Array.isArray(models) ? models : [];
+      const hits = list.filter(
+        (m) => isRecord(m) && m.id === text && typeof m.provider === 'string' && m.provider !== '',
+      );
+      if (hits.length === 1) return { provider: hits[0].provider, model: String(hits[0].id) };
+      if (hits.length > 1) return null;
+      const slash = text.indexOf('/');
+      if (slash > 0 && slash < text.length - 1) {
+        const provider = text.slice(0, slash);
+        // ⚠️ 这里比后端**更严**，且是有意的：
+        //   后端 models.js 对自描述形式的退化分支不做目录校验（目录查不到也照样解析），
+        //   那是给「目录服务临时不可用」的兜底。但前端只应发出**确信会成功**的请求 ——
+        //   目录已就绪却找不到这个 provider，说明选中值已过期，发过去只会换一个错误码。
+        //   目录为空（未就绪）同样一律拒绝：此刻没有任何值能被证实。
+        if (list.length === 0) return null;
+        if (list.some((m) => isRecord(m) && m.provider === provider)) {
+          return { provider, model: text.slice(slash + 1) };
+        }
+        return null;
+      }
+      return null;
+    }
+
+    /**
+     * 把「当前选中值 / localStorage 旧值」纠正成一个**能被路由解析**的选项值。
+     *
+     * 为什么要纠正而不是让用户自己再选一次：用户是在页面刚冷启动、目录还在路上的时候点的
+     * 「立即生成」（这不是他选错了，是时序）。把选择权还给他等于让 bug 重现一次。
+     * 目录一到就自动落到目录里的第一项，并写回 localStorage —— 这样他**下一次点必然成功**。
+     *
+     * @returns {string} 能解析的选项值；目录为空时返回 ''（调用方据此禁用按钮）。
+     */
+    function resolveSelectedModel(raw, models) {
+      const list = Array.isArray(models) ? models : [];
+      // 目录为空是唯一的「无解」：此时没有可纠正的目标，只能让调用方禁用按钮。
+      if (list.length === 0) return '';
+      const text = typeof raw === 'string' ? raw : '';
+      if (text !== '') {
+        // 1) 已经是某个选项的原值 → 原样保留（不打断用户刚做的选择）。
+        for (const model of list) {
+          if (modelOptionValue(model) === text) return text;
+        }
+        // 2) localStorage 里可能是**裸 id**（旧版本存过），按唯一命中还原成 <provider>/<id>。
+        const byId = list.filter((m) => isRecord(m) && m.id === text);
+        if (byId.length === 1) return modelOptionValue(byId[0]);
+        // 3) 自描述形式 'provider/model'：只有 provider **仍在目录里**才认。
+        //    provider 已消失说明这是过期值，留着会让服务端把请求打到一个不存在的适配器上
+        //    （resolveModelRoute 对自描述形式**不做目录校验**，照样解析得出来 —— 这正是
+        //    「点得下去、一定失败」的另一条暗路，必须在前端挡掉）。
+        const slash = text.indexOf('/');
+        if (slash > 0 && slash < text.length - 1 && list.some((m) => isRecord(m) && m.provider === text.slice(0, slash))) {
+          return text;
+        }
+      }
+      // 4) 兜底：无有效选择 / 选择已过期 → 纠正为目录第一项。
+      //    list 的顺序由 models.js 排序（provider,id）保证稳定，同输入必同输出。
+      //    ⚠️ 这里**不能**返回 ''：那正是本次 Bug 的形态（点了没反应）。
+      return modelOptionValue(list[0]);
+    }
 
     /** 自动模式的轮询周期：5 分钟。够用且不会给只读扫描加压。 */
     const AUTO_INTERVAL_MS = 5 * 60 * 1000;
@@ -1910,11 +2783,36 @@ window.__ModuleLoader__.load({
       '.asov_notice{border:1px solid var(--as-line);border-radius:10px;padding:10px 12px;margin-bottom:14px;',
       'font-size:12px;line-height:18px;background:var(--as-card);color:var(--as-text2)}',
       '.asov_notice_warn{border-color:var(--as-appr);background:var(--as-appr-bg);color:var(--as-appr)}',
+      // 说明性提示的折叠块（2026-10-07）：默认收起，界面上只占一行，展开才逐条。
+      '.asov_notes{border:1px dashed var(--as-line);border-radius:10px;padding:8px 12px;margin-bottom:14px;',
+      'font-size:12px;line-height:18px;color:var(--as-tertiary);background:transparent}',
+      '.asov_notes_summary{cursor:pointer;outline:none;user-select:none}',
+      '.asov_notes_summary:hover{color:var(--as-text2)}',
+      '.asov_notes_list{margin:8px 0 0;padding:0 0 0 18px;display:flex;flex-direction:column;gap:4px}',
+      '.asov_notes_item{font-size:12px;line-height:18px;color:var(--as-tertiary);word-break:break-word}',
+      // Bug 2 的顶部错误提示条：与 .asov_error 同一套 token，只是**不占满**正文区。
+      '.asov_notice_error{border-color:var(--as-appr);background:var(--as-appr-bg);color:var(--as-appr);',
+      'white-space:pre-wrap;word-break:break-word}',
+      '.asov_notice_errorTitle{font-weight:600;margin-bottom:4px}',
+      '.asov_notice_errorBody{font-size:12px;line-height:18px}',
       '.asov_ws{border:1px solid var(--as-line);border-radius:12px;margin-bottom:14px;background:var(--as-card);overflow:hidden}',
       '.asov_ws_head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid var(--as-line)}',
       '.asov_ws_name{font-weight:600;font-size:14px;color:var(--as-text)}',
       '.asov_ws_path{font-size:11px;color:var(--as-tertiary);font-family:var(--ds-font-family-code,monospace);word-break:break-all}',
       '.asov_ws_meta{margin-left:auto;font-size:11px;color:var(--as-tertiary);white-space:nowrap}',
+      // 2026-10-07 隐藏工作区：卡片头尾的「隐藏」按钮 + 工具栏的「已隐藏（N）」入口。
+      // 用 --as-* 既有 token，不引入新依赖；沿用 asov_button 的形态避免两套按钮样式。
+      '.asov_hideBtn{height:24px;border-radius:6px;font-size:11px;padding:0 8px;cursor:pointer;',
+      'border:1px solid var(--as-line);background:transparent;color:var(--as-tertiary);white-space:nowrap}',
+      '.asov_hideBtn:hover:not(:disabled){color:var(--as-appr);border-color:var(--as-appr)}',
+      '.asov_hideBtn:disabled{opacity:.5;cursor:default}',
+      '.asov_hidden{border:1px dashed var(--as-line);border-radius:10px;padding:6px 10px;font-size:12px;color:var(--as-tertiary)}',
+      '.asov_hidden_summary{cursor:pointer;outline:none;user-select:none}',
+      '.asov_hidden_summary:hover{color:var(--as-text2)}',
+      '.asov_hidden_list{margin:8px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px}',
+      '.asov_hidden_item{display:flex;align-items:center;gap:8px;font-size:11px;font-family:var(--ds-font-family-code,monospace);word-break:break-all}',
+      '.asov_restoreBtn{flex:0 0 auto;height:22px;border-radius:6px;font-size:11px;padding:0 8px;cursor:pointer;',
+      'border:1px solid var(--as-accent-line);background:var(--as-accent-bg);color:var(--as-accent);font-family:inherit}',
       '.asov_badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;line-height:16px}',
       '.asov_badge_new{background:var(--as-accent-bg);color:var(--as-accent);border:1px solid var(--as-accent-line)}',
       '.asov_ws_body{padding:12px 14px}',
@@ -2055,78 +2953,173 @@ window.__ModuleLoader__.load({
     /**
      * 把服务端诊断串压缩成一句话摘要（完整串留给 title）。
      *
-     * 与 ui/sidebar.js 的同名函数**逐字一致**（包括 60 字截断阈值）：
-     * 优先取 message=（最贴近人话），其次 input_summary=，都取不到就整串截断。
-     * 行为必须一致，否则同一串在左窗和总览页会显示成两句话。
+     * 与 ui/sidebar.js 的同名函数**逐字一致**（包括 60 字阈值与三级兜底）：
+     * 规范格式下直接取 message 段；解析不出（历史 key=value 串 / 非本插件产出）时
+     * 回落到旧的 key=value 抽取，再不行整串截断。
+     * 行为必须一致，否则**同一串在左窗和总览页会显示成两句话** ——
+     * tests/temp-e2e-warning-groups.mjs 专门对两份实现跑同一组夹具断言一致。
+     * （2026-10-07 实测踩过：只改了左窗的摘要、总览页还在按 key=value 抽，
+     *   同一条 PROJECTION_INVALID_JSON 在两页显示成两句话。）
      */
     function summarizeWarning(raw) {
       const text = str(raw);
       if (text === '') return '有一条非致命提示（悬停查看详情）';
-      // 优先取 message=（最贴近人话），其次 input_summary=。
+      const parsed = parseWarningLine(text);
+      if (parsed !== null && parsed.message !== '') {
+        return parsed.message.length > 60 ? parsed.message.slice(0, 60) + '…' : parsed.message;
+      }
+      // 兜底一：规范格式但没有 message 段 → 用 CODE + target 表达
+      if (parsed !== null) {
+        const fallback = (parsed.code === '' ? '' : parsed.code) + (parsed.target === '' ? '' : ' ' + parsed.target);
+        if (fallback !== '') return fallback.length > 60 ? fallback.slice(0, 60) + '…' : fallback;
+      }
+      // 兜底二：历史 key=value 形态（保留仅为向后兼容，**不作为预期/故障判定依据**）
       const pick = (key) => {
         const m = text.match(new RegExp(key + '=([^]*?)(?=\\s+[a-z_]+=|$)'));
         return m !== null && m !== undefined ? str(m[1]).trim() : '';
       };
       const msg = pick('message') || pick('input_summary');
       if (msg !== '') return msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
-      // 兜底：整串截断。
+      // 兜底三：整串截断。
       return text.length > 60 ? text.slice(0, 60) + '…' : text;
     }
 
     /**
-     * 解析 warnLine 的行格式：[operation] target -> ERROR_CODE: message {contextJson}
+     * 解析服务端诊断串的**规范格式**（2026-10-07 统一）：
      *
-     * 为什么不用 JSON.parse：warnings 是**拼出来的字符串**（服务端 src/overview.js
-     * 的 warnLine），不是 JSON。这里只做尽力而为的前缀解析，解析不出就返回 null，
-     * 由调用方按「无法归类的单条」降级处理 —— 宁可不合并，也不能吞掉内容。
+     *     [operation] target -> ERROR_CODE: message {contextJson}
+     *
+     * 这个格式由服务端 src/overview.js 的 warnLine 定义，**src/states.js 的 describeError
+     * 现在也产出同一形态**（此前它产出的是 `[states] operation=… error_code=Error` 的
+     * key=value 串，正则匹配不上 → 左窗那两条提示全部落进「未分组」逐条刷屏）。
+     *
+     * 为什么不用一条正则搞定：`message` 里可能含花括号，一��正则的惰性分组会把
+     * message 截断、并把 message 的一段当成 context。改成**从右往左**找可 JSON.parse 的
+     * 尾段 —— context 永远是最后一段且必然是合法 JSON，所以这个判定是无歧义且确定的。
+     *
+     * 解析不出就返回 null，由调用方按「无法归类的单条」降级处理 —— 宁可不合并，也不能吞内容。
      */
     function parseWarningLine(raw) {
       const text = str(raw);
       if (text === '') return null;
-      const m = text.match(/^\[([^\]]*)\]\s*([\s\S]*?)\s*->\s*([A-Za-z0-9_]+)\s*(?::\s*([\s\S]*?))?(?:\s+(\{[\s\S]*\}))?\s*$/);
-      if (m === null || m === undefined) return null;
-      return {
-        operation: str(m[1]),
-        target: str(m[2]),
-        code: str(m[3]),
-        message: str(m[4]),
-        context: str(m[5]),
-        raw: text,
-      };
+      // 1) 方括号里是 operation
+      const head = text.match(/^\[([^\]]*)\]\s*([\s\S]*)$/);
+      if (head === null || head === undefined) return null;
+      const operation = str(head[1]);
+      const rest = str(head[2]);
+
+      // 2) target 与 CODE 之间用 ' -> ' 分隔。取**最后一个** ' -> '：
+      //    target 是路径，正则惰性匹配只取第一个，中途出现 ' -> ' 就会把后半截当成 CODE。
+      const arrow = rest.lastIndexOf(' -> ');
+      if (arrow <= 0) return null;
+      const target = rest.slice(0, arrow).trim();
+      const tail = rest.slice(arrow + 4).trim();
+
+      // 3) CODE 必须是 [A-Za-z0-9_]+
+      const codeMatch = tail.match(/^([A-Za-z0-9_]+)\s*([\s\S]*)$/);
+      if (codeMatch === null || codeMatch === undefined) return null;
+      const code = str(codeMatch[1]);
+      let body = str(codeMatch[2]).trim();
+      if (body.startsWith(':')) body = body.slice(1).trim();
+
+      // 4) 尾段若能 JSON.parse 成对象，就是 context（从右往左试）
+      let context = '';
+      let message = body;
+      for (let i = body.lastIndexOf('{'); i >= 0; i = body.lastIndexOf('{', i - 1)) {
+        if (i <= 0) break;
+        try {
+          const parsed = JSON.parse(body.slice(i));
+          if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            context = body.slice(i);
+            message = body.slice(0, i).trim();
+            break;
+          }
+        } catch {
+          /* 不是合法 JSON 尾段，继续往左找 */
+        }
+      }
+      return { operation, target, code, message, context, raw: text };
     }
 
+    // ---------------------------------------------------------------------------
+    // 警告的「预期 vs 故障」判定表（2026-10-07）
+    //
+    // 用户原话：「这一块别留着……要么解决要么别提示」。两条路：真去消除（做不到 ——
+    // 截断/降级是插件保护宿主的必要行为，笔记多了必然触发），或**做到不常驻打扰**。
+    // 本表就是后者的落点：
+    //
+    //   ⚠️ 预期项（EXPECTED）→ 折叠成一行「N 项说明性提示，点击展开」，默认不展开，
+    //      且**不进首屏噪音区**；完整原串全部保留在 title 与展开区里，可诊断性不丢。
+    //   ❌ 真故障（其余全部）→ 常驻可见，行为与之前一致，绝不折叠、绝不丢弃。
+    //
+    // ⚠️ 归类依据是 **error_code**，不是字符串猜测。而 error_code 能可靠存在的前提是
+    //    服务端每条告警都产出规范格式 + 真实 code（states.js 已改造）——
+    //    解析不出来的串一律按**故障**处理（宁可多显示一条，也不藏真实问题）。
+    //
+    // ⚠️ 本表与 ui/sidebar.js 的同名表**逐字一致**：两个 UI 是分别内联进 client.js 的
+    //    独立工厂，DSH 客户端 require 不了同包子路径，跨文件 import 会被 loader 拒绝。
+    //    tests/temp-e2e-warning-groups.mjs 对两份实现跑同一组夹具并断言输出相同，
+    //    防止「改了一边忘了另一边」。
+    // ---------------------------------------------------------------------------
+
     /**
-     * 同类说明性提示的合并规则表。
+     * 预期行为（非故障）的 error_code → 合并文案。
      *
-     * ⚠️ 这些提示是**预期行为、不是错误**：扫描按上限截断文件清单、丢弃非绝对
-     * cwd，都是插件在保护宿主。逐条铺开除了占满面板，还会让用户误以为插件坏了，
-     * 所以合并成一条计数说明。**文案不得写成「错误/失败」**。
+     * ⚠️ 这张表覆盖了服务端**全部**设计内降级码（states.js + overview.js 两个产出方），
+     * 逐条列全是有意的：漏一个码，那类降级就会以「真故障」的姿态常驻刷屏 ——
+     * 这正是本次用户投诉的现象（2026-10-07 真机 e2e 就抓到漏网的
+     * EXCERPT_BUDGET_EXHAUSTED）。新增降级码时必须同步登记到这张表。
+     *
+     * 判定口径只有一条：**这是插件为了保护宿主/自己主动做的让步吗？**
+     *   是 → 预期（折叠，不常驻打扰）
+     *   否 → 故障（常驻可见）—— 包括读不到、解析失败、llm 不可用、生成失败。
      *
      * 顺序即展示顺序，是这张表的数组顺序（不是对象枚举顺序）—— 保证确定性。
      */
-    const WARNING_GROUPS = [
+    const EXPECTED_WARNING_GROUPS = [
+      // ── 总览页（src/overview.js）：扫描/摘录的上限保护 ──
       { code: 'WORKSPACE_TRUNCATED', label: (n) => n + ' 个工作区的笔记已截断（文件数/体积超限）' },
-      { code: 'CWD_NOT_ABSOLUTE', label: (n) => n + ' 个会话的 cwd 不是绝对路径，已降级' },
-      { code: 'CWD_NOT_ABSOLUTE_MANY', label: (n) => n + ' 条非绝对 cwd 已全部丢弃' },
+      { code: 'FILE_TOO_LARGE', label: (n) => n + ' 个超大文件已被跳过（单文件超过体积上限）' },
+      { code: 'ENTRY_BUDGET_EXCEEDED', label: (n) => n + ' 处目录扫描触达条目上限，子目录未继续深入' },
+      { code: 'EXCERPT_BUDGET_EXHAUSTED', label: (n) => n + ' 处笔记摘录预算用尽（超出的文件只列路径）' },
+      { code: 'SESSION_SCAN_CAPPED', label: (n) => n + ' 处会话扫描达到文件数上限（更早的会话未纳入）' },
+      // ── cwd 归一化（overview.js 与 states.js 共用同一码，因此两边合并成一条）──
+      { code: 'CWD_NOT_ABSOLUTE', label: (n) => n + ' 个会话/目录的 cwd 不是绝对路径，已降级' },
+      { code: 'CWD_NOT_ABSOLUTE_MANY', label: (n) => n + ' 条非绝对路径已全部丢弃' },
+      // ── 三态扫描（src/states.js）──
+      { code: 'SESSION_LOG_MISSING', label: (n) => n + ' 个会话没有可读的会话日志，已按「不判活」处理' },
+      { code: 'DUPLICATE_SESSION_ID', label: (n) => n + ' 条重复的会话投影已去重' },
+      // ── 生成路径（src/index.js）：省 token 的设计内复用 ──
+      { code: 'NOTE_CACHE_REUSED', label: (n) => n + ' 处复用了上次生成结果（笔记未变化，未调用模型）' },
+      { code: 'NOTE_PERSISTED_REUSED', label: (n) => n + ' 处复用了已落盘的总结（笔记指纹一致，未调用模型）' },
+      // ── 生成路径（src/index.js）：没有笔记就没有可总结的内容 ──
+      // ⚠️ 2026-10-07 新增。跳过空工作区是**主动省钱**的设计内让步（实测 21 个工作区里
+      //    8 个是 0 文件，旧实现照样发起模型调用、只能回「摘录不足以判断」），
+      //    不是故障。漏登记这一条，它就会以「真故障」的姿态常驻刷屏 —— 上一轮刚踩过这个坑。
+      { code: 'EMPTY_WORKSPACE_SKIPPED', label: (n) => n + ' 个工作区没有笔记类文件，已跳过生成（未调用模型）' },
     ];
 
     /**
-     * 把服务端 warnings 折成若干条「展示项」。
+     * 把服务端 warnings 折成「故障（常驻）」与「说明（折叠）」两堆。
      *
-     * 顺序：先按 WARNING_GROUPS 的固定表序输出合并项，再按**原始数组下标序**输出
-     * 未合并的单条。全程只依赖下标与表序，不依赖对象枚举顺序 → 同输入必同输出。
+     * 顺序：每堆内部先按 EXPECTED_WARNING_GROUPS 的固定表序输出合并项，
+     * 再按**原始数组下标序**输出未合并的单条。全程只依赖下标与表序 →
+     * 同输入必同输出（契约 §3.5 确定性要求）。
      *
      * @param {unknown} warnings 服务端 warnings 数组（不可信输入）
-     * @returns {Array<{key:string, text:string, detail:string, count:number, grouped:boolean}>}
+     * @returns {{faults: Array<{key,text,detail,count,grouped}>,
+     *            notes:  Array<{key,text,detail,count,grouped}>}}
      */
-    function buildWarningNotices(warnings) {
+    function classifyWarnings(warnings) {
       const list = (Array.isArray(warnings) ? warnings : []).map(str).filter((text) => text !== '');
       const info = list.map(parseWarningLine);
+      const expectedCodes = new Set(EXPECTED_WARNING_GROUPS.map((g) => g.code));
       const used = [];
       for (let i = 0; i < list.length; i += 1) used.push(false);
-      const out = [];
+      const faults = [];
+      const notes = [];
 
-      for (const group of WARNING_GROUPS) {
+      for (const group of EXPECTED_WARNING_GROUPS) {
         const members = [];
         for (let i = 0; i < info.length; i += 1) {
           if (used[i] === true) continue;
@@ -2136,10 +3129,10 @@ window.__ModuleLoader__.load({
           }
         }
         if (members.length === 0) continue;
-        out.push({
-          key: 'wg:' + group.code,
+        notes.push({
+          key: 'we:' + group.code,
           text: group.label(members.length),
-          // 完整原串一条都不丢，按原下标序用换行拼接进 title（悬停可见）。
+          // 完整原串一条都不丢，按原下标序用换行拼接（title 悬停 + 展开区都可见）。
           detail: members.map((i) => list[i]).join('\n'),
           count: members.length,
           grouped: true,
@@ -2148,17 +3141,23 @@ window.__ModuleLoader__.load({
 
       for (let i = 0; i < list.length; i += 1) {
         if (used[i] === true) continue;
-        out.push({
-          // key 用下标而不是原串：原串可能重复，用串做 key 会撞 React key。
+        const parsed = info[i];
+        // 解析不出来的串 = 无法证明它是预期行为 → 按故障常驻显示（fail-safe）。
+        const isExpected = parsed !== null && parsed !== undefined && expectedCodes.has(parsed.code);
+        // key 用下标而不是原串：原串可能重复，用串做 key 会撞 React key。
+        const item = {
           key: 'w:' + i,
           text: summarizeWarning(list[i]),
           detail: list[i],
           count: 1,
           grouped: false,
-        });
+        };
+        if (isExpected) notes.push(item);
+        else faults.push(item);
       }
-      return out;
+      return { faults, notes };
     }
+
 
     /**
      * 工厂：接收 React（由 src/client.js 注入），返回视图组件与注册函数。
@@ -2190,6 +3189,31 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * 说明性提示的**折叠块**（2026-10-07）。默认收起，界面上只常驻一行标题；
+       * 展开后每条一行、悬停还能看到完整原串 —— 「不常驻打扰」与「不丢信息」同时满足。
+       *
+       * ⚠️ 用原生 <details>/<summary>：不需要额外 state、不需要事件处理，
+       *    也不会与两个 UI 各自的渲染路径打架（两个工厂各有一份同名实现，语义逐字一致）。
+       */
+      function NoticeNotes(props) {
+        const items = Array.isArray(props.items) ? props.items : [];
+        const count = items.reduce((sum, item) => sum + (typeof item.count === 'number' ? item.count : 1), 0);
+        const detail = items
+          .map((item) => (item.grouped === true ? item.text + '\n' + item.detail : item.detail))
+          .join('\n');
+        return h(
+          'details',
+          { className: 'asov_notes', title: detail },
+          h('summary', { className: 'asov_notes_summary' }, '说明性提示（' + String(count) + ' 项，点击展开查看）'),
+          h(
+            'ul',
+            { className: 'asov_notes_list' },
+            items.map((item) => h('li', { className: 'asov_notes_item', key: item.key, title: item.detail }, item.text)),
+          ),
+        );
+      }
+
+      /**
        * 工作总览主视图。作为 conversation.view 的条目组件渲染，
        * 因此它占满中间主界面，而不是浮层。
        */
@@ -2199,13 +3223,22 @@ window.__ModuleLoader__.load({
           result: null,
           error: null,
           generating: false,
-          models: PLACEHOLDER_MODELS,
-          modelsPlaceholder: true,
+          // ⚠️ 初始**空目录**而不是占位表：冷启动时模型目录还没回来，
+          // 此时任何默认值都必然解析不出路由（见上面 canResolveRoute 的说明）。
+          // 空目录 + 按钮禁用 + 「正在读取模型列表…」文案，是唯一不会骗人的初态。
+          models: [],
+          modelsLoaded: false,
           auto: readLocal(LS_AUTO) === '1',
-          model: readLocal(LS_MODEL) || PLACEHOLDER_MODELS[0].id,
+          // 只持久化**真实选过的**模型；不写默认值，避免把占位串存进 localStorage 变成长期脏值。
+          model: readLocal(LS_MODEL) || '',
           changed: false,
           lastGeneratedAt: 0,
           summaries: {},
+          // 已隐藏工作区的 cwd 列表（2026-10-07）。由服务端 hiddenList 驱动，
+          // 不在 localStorage 里存：单一真相在服务端文件里，客户端只做镜像。
+          hidden: [],
+          // 正在提交切换的 cwd（非空时该卡片与恢复按钮禁用，防重复提交）。
+          pendingCwd: '',
         });
         const aliveRef = React.useRef(true);
         React.useEffect(() => {
@@ -2250,19 +3283,31 @@ window.__ModuleLoader__.load({
             const previous = readLocal(LS_SIGNATURE);
             const changed = previous !== null && previous !== '' && previous !== signature;
             const models = Array.isArray(data.models)
-              ? data.models.filter((item) => isRecord(item) && typeof item.id === 'string')
+              ? data.models.filter((item) => isRecord(item) && typeof item.id === 'string' && modelOptionValue(item) !== '')
               : [];
+            // ── 目录到达 → 自动纠正选中值（2026-10-07 用户实测 Bug 的正解）────────
+            // 用户是在**目录还在路上**的时候点的「立即生成」，所以责任不在他。
+            // 这里把「占位串 / 空值 / 目录里已不存在的旧值」统一纠正成目录首项，
+            // 并写回 localStorage —— 他随后再点一次就必然命中真实模型。
+            const wanted = resolveSelectedModel(state.model, models);
+            if (wanted !== '' && wanted !== state.model) writeLocal(LS_MODEL, wanted);
             patch({
               status: 'ready',
               result: data,
               error: null,
               changed: changed,
-              models: models.length > 0 ? models : PLACEHOLDER_MODELS,
-              modelsPlaceholder: models.length === 0,
+              models: models,
+              modelsLoaded: true,
+              model: wanted,
               summaries: isRecord(data.summaries) ? data.summaries : state.summaries,
+              // hiddenList 是**全量**隐藏名单（含已不是工作区根的那些），
+              // 工具栏「已隐藏（N）」与恢复入口按它渲染，绝不按本页少了几张卡片来猜。
+              hidden: Array.isArray(data.hiddenList)
+                ? data.hiddenList.filter((item) => typeof item === 'string' && item !== '')
+                : [],
             });
           },
-          [patch, state.summaries],
+          [patch, state.summaries, state.model],
         );
 
         React.useEffect(() => {
@@ -2277,6 +3322,9 @@ window.__ModuleLoader__.load({
          */
         const changedRef = React.useRef(false)
         const generatingRef = React.useRef(false)
+        // 隐藏切换的在途标记。用 ref 而不是直接读 state.pendingCwd：
+        // 连续两次点击之间 state 还没提交，用 state 会漏掉"上一次还在飞"这一段。
+        const pendingCwdRef = React.useRef('')
         React.useEffect(() => {
           changedRef.current = state.changed === true
         }, [state.changed])
@@ -2303,13 +3351,101 @@ window.__ModuleLoader__.load({
         );
 
         /**
+         * 隐藏 / 恢复某个工作区（2026-10-07）。
+         *
+         * 失败必须**可见**：沿用既有的 state.error 提示条通路（下面 notices 里那条红色横幅），
+         * 不新造一套 toast —— 两个 UI 已经有 classifyWarnings/state.error 这套机制，
+         * 再加一条并行通道只会让「哪里会出错」变得不可预测。
+         *
+         * 成功后的两件事：
+         *   1) 立即把 hidden 列表换成服务端回的权威值（而不是本地推算，避免与服务端漂移）；
+         *   2) 立刻把卡片从列表里拿掉 —— 不等下一轮轮询，否则用户会以为没生效又点一次。
+         */
+        const onToggleHidden = React.useCallback(
+          async (rawCwd, hide) => {
+            const cwd = String(rawCwd ?? '');
+            if (cwd === '' || pendingCwdRef.current !== '') return;
+            // 二次确认：隐藏是破坏性的**可见性**变更，总览页一屏 20+ 张卡片很容易误点。
+            // confirm 在非浏览器环境（node 单测）不存在，此时按「已确认」放行 ——
+            // 否则本函数在测试里会永远走不到发请求那一步。
+            const confirmFn = typeof globalThis !== 'undefined' ? globalThis.confirm : undefined;
+            if (typeof confirmFn === 'function') {
+              if (confirmFn(hiddenConfirmText(cwd, hide)) !== true) return;
+            }
+            pendingCwdRef.current = cwd;
+            patch({ pendingCwd: cwd, error: null });
+            const response = await jsonFetch(OVERVIEW_HIDDEN_ENDPOINT, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ cwd: cwd, hidden: hide === true }),
+            });
+            pendingCwdRef.current = '';
+            if (!response.ok) {
+              const envelope = response.data;
+              const detail = isRecord(envelope) && typeof envelope.error === 'string' ? envelope.error : response.message;
+              patch({
+                pendingCwd: '',
+                error: (hide === true ? '隐藏失败' : '恢复失败') + '（operation=toggleWorkspaceHidden target='
+                  + OVERVIEW_HIDDEN_ENDPOINT + ' error_code=' + response.code + '）：' + detail,
+              });
+              return;
+            }
+            const envelope = response.data;
+            const data = isRecord(envelope) && isRecord(envelope.data) ? envelope.data : (isRecord(envelope) ? envelope : {});
+            const nextHidden = Array.isArray(data.hiddenList)
+              ? data.hiddenList.filter((item) => typeof item === 'string' && item !== '')
+              : state.hidden;
+            // 立即移除卡片：不等轮询。用户点完还要等 5 分钟才看到变化 =「点了没反应」。
+            // 只在**隐藏**方向做本地移除；恢复方向目标卡片根本不在列表里，本地无从加回，
+            // 必须重新取一次 0 token 的 GET（见下）。
+            const prevResult = state.result;
+            const prevWorkspaces = isRecord(prevResult) && Array.isArray(prevResult.workspaces) ? prevResult.workspaces : [];
+            patch({
+              pendingCwd: '',
+              hidden: nextHidden,
+              result: hide === true
+                ? { ...(isRecord(prevResult) ? prevResult : {}), workspaces: prevWorkspaces.filter((ws) => String(ws?.cwd ?? '') !== cwd) }
+                : prevResult,
+            });
+            if (hide !== true) await refresh('silent');
+          },
+          [patch, state.hidden, state.result, refresh],
+        );
+
+        /**
          * 「立即生成」。开火的是本插件的端点；真正的模型调用属于集成方职责
          * （契约 §3 已写明：本模块只负责组装 prompt）。
          * 端点若回 summaries（集成方已代跑模型），就直接展示；否则把 prompt 交给调用方处理。
          */
         const onGenerate = React.useCallback(async () => {
+          // ── POST 前预校验（2026-10-07）────────────────────────────────────
+          // 规则与服务端 models.js 的 resolveModelRoute **逐条一致**，由 resolveSelectedModel
+          // 在目录刷新时已把 state.model 纠正成可解析值；这里再兜一层：
+          //   1) 目录还没回来 → 不发请求（原来发出去就是注定失败的 POST）；
+          //   2) 目录为空（llm 不可用）→ 明确说「模型服务不可用」，而不是让用户以为是自己操作错；
+          //   3) 选中值解析不出路由 → 明确说「请在下拉里选择具体模型」，同样不发请求。
+          // 三种情况都给出可读原因，不允许再出现「点了没反应 / 报错但看不出为什么」。
+          if (generatingRef.current === true) return;
+          if (state.models.length === 0) {
+            patch({
+              error: state.modelsLoaded === true
+                ? '模型服务不可用，无法生成（operation=generateOverview target=' + OVERVIEW_GENERATE_ENDPOINT +
+                  ' error_code=MODEL_CATALOG_EMPTY）。请检查 dsh-llm 服务是否正常；下方工作区列表不受影响。'
+                : '正在读取模型列表，请稍候再点「立即生成」（operation=generateOverview target=' +
+                  OVERVIEW_GENERATE_ENDPOINT + ' error_code=MODEL_CATALOG_NOT_READY）。',
+            });
+            return;
+          }
+          if (canResolveRoute(state.model, state.models) === null) {
+            patch({
+              error: '请先在下拉里选择一个具体模型（当前选中：' + JSON.stringify(state.model) + '，它无法解析成模型路由；' +
+                'operation=generateOverview target=' + OVERVIEW_GENERATE_ENDPOINT + ' error_code=MODEL_ROUTE_UNRESOLVED）。',
+            });
+            return;
+          }
           patch({ generating: true, error: null });
-          const response = await jsonFetch(OVERVIEW_ENDPOINT, {
+          // ⚠️ 必须打 /overview/generate，不是 /overview —— 见 OVERVIEW_GENERATE_ENDPOINT 的说明。
+          const response = await jsonFetch(OVERVIEW_GENERATE_ENDPOINT, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ generate: true, model: state.model }),
@@ -2317,7 +3453,7 @@ window.__ModuleLoader__.load({
           if (!response.ok) {
             patch({
               generating: false,
-              error: '生成失败（operation=generateOverview target=' + OVERVIEW_ENDPOINT + ' error_code=' + response.code + '）：' + response.message,
+              error: '生成失败（operation=generateOverview target=' + OVERVIEW_GENERATE_ENDPOINT + ' error_code=' + response.code + '）：' + response.message,
             });
             return;
           }
@@ -2327,6 +3463,13 @@ window.__ModuleLoader__.load({
           const summaries = isRecord(data.summaries) ? data.summaries : {};
           const generated = Object.keys(summaries).length > 0;
           writeLocal(LS_SIGNATURE, signatureOf(data));
+          // ⚠️ 后端的诊断必须落到界面上（要求 4）。此前这里只给一句笼统的 NO_SUMMARIES，
+          // 服务端真正的原因（路由未解析 / 某个工作区超时 / llm 报错）被丢在 data.warnings 里没人看。
+          // 现在把新增的 warnings 原样附在错误正文后面：一条都不丢，且用户能看懂。
+          const backendWarnings = (Array.isArray(data.warnings) ? data.warnings : [])
+            .map(str)
+            .filter((text) => text !== '')
+            .slice(0, 5);
           patch({
             generating: false,
             result: Array.isArray(data.workspaces) ? data : state.result,
@@ -2335,10 +3478,10 @@ window.__ModuleLoader__.load({
             lastGeneratedAt: Date.now(),
             error: generated
               ? null
-              : '模型未返回任何总结（operation=generateOverview target=' + OVERVIEW_ENDPOINT + ' error_code=NO_SUMMARIES）。'
-                + '常见原因：所选模型路由未解析（请在下拉里选择具体模型），或该工作区没有可读笔记。',
+              : '模型未返回任何总结（operation=generateOverview target=' + OVERVIEW_GENERATE_ENDPOINT + ' error_code=NO_SUMMARIES）。'
+                + '服务端诊断：\n' + (backendWarnings.length > 0 ? backendWarnings.join('\n') : '（服务端未附 warnings）'),
           });
-        }, [patch, state.model, state.result, state.summaries]);
+        }, [patch, state.model, state.result, state.summaries, state.models]);
 
         // 把最新的 onGenerate 同步到 ref，供自动模式定时器调用。
         // 顺序上必须在 onGenerate 声明之后，否则是 TDZ 引用。
@@ -2370,6 +3513,10 @@ window.__ModuleLoader__.load({
         const workspaces = isRecord(result) && Array.isArray(result.workspaces) ? result.workspaces : [];
         const counts = isRecord(result) && isRecord(result.counts) ? result.counts : {};
         const warnings = isRecord(result) && Array.isArray(result.warnings) ? result.warnings : [];
+        // 已隐藏工作区（服务端 hiddenList 的镜像）。渲染时一律按它算「已隐藏（N）」，
+        // 不按「列表少了几张」倒推 —— 那两者本来就不一定相等（被隐藏的 cwd 可能已不是工作区根）。
+        const hiddenList = Array.isArray(state.hidden) ? state.hidden : [];
+        const pendingCwd = String(state.pendingCwd ?? '');
 
         const header = h(
           'div',
@@ -2381,12 +3528,47 @@ window.__ModuleLoader__.load({
             h(
               'small',
               null,
-              workspaces.length + ' 个工作区 · ' + String(counts.files === undefined ? 0 : counts.files) + ' 个文件',
+              workspaces.length + ' 个工作区 · ' + String(counts.files === undefined ? 0 : counts.files) + ' 个文件'
+                + (hiddenList.length > 0 ? ' · 已隐藏 ' + String(hiddenList.length) + ' 个' : ''),
             ),
           ),
           h(
             'div',
             { className: 'asov_controls' },
+            // ── 「已隐藏（N）」入口（2026-10-07）────────────────────────────────
+            // **没有隐藏项时整个不渲染**：一个永远显示「已隐藏（0）」的按钮
+            // 会让用户以为有东西被藏了却找不到，徒增疑虑。
+            // 用原生 <details> 而非受控 state：与既有 NoticeNotes 同一形态，
+            // 不需要额外 state、不会与两个 UI 各自的渲染路径打架。
+            hiddenList.length === 0
+              ? null
+              : h(
+                  'details',
+                  { className: 'asov_hidden', title: '已从本页隐藏的工作区。DSH 的工作区、侧栏与会话记录不受影响。' },
+                  h('summary', { className: 'asov_hidden_summary' }, '已隐藏（' + String(hiddenList.length) + '）'),
+                  h(
+                    'ul',
+                    { className: 'asov_hidden_list' },
+                    hiddenList.map((cwd) =>
+                      h(
+                        'li',
+                        { className: 'asov_hidden_item', key: String(cwd) },
+                        h('span', null, String(cwd)),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'asov_restoreBtn',
+                            disabled: pendingCwd !== '',
+                            title: '让它重新出现在「工作总览」这一页（不影响任何 DSH 数据）',
+                            onClick: () => onToggleHidden(cwd, false),
+                          },
+                          state.pendingCwd === String(cwd) ? '恢复中…' : '恢复',
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
             h(
               'label',
               {
@@ -2404,16 +3586,23 @@ window.__ModuleLoader__.load({
               '模型',
               h(
                 'select',
-                { className: 'asov_select', value: state.model, onChange: onSelectModel },
-                // value 用 "provider/id" 而不是裸 id：不同 provider 可能有同名 model，
-                // 裸 id 会让服务端无法消歧（resolveModelRoute 在歧义时返回 null）。
-                // 服务端 resolveModelRoute 明确支持这种自描述形式。
-                state.models.map((model) => {
-                  const value = typeof model.provider === 'string' && model.provider.length > 0
-                    ? model.provider + '/' + String(model.id)
-                    : String(model.id)
-                  return h('option', { key: value, value }, String(model.name || model.id))
-                }),
+                {
+                  className: 'asov_select',
+                  value: state.model,
+                  onChange: onSelectModel,
+                  disabled: state.models.length === 0,
+                  title: state.models.length === 0
+                    ? '没有可用的模型（dsh-llm 目录为空），无法生成总结'
+                    : '选择用于生成工作区总结的模型',
+                },
+                // ⚠️ 目录未就绪时**不放任何假选项**：旧版的 'session-default' 占位项
+                // 会让用户点出一个注定失败的 POST（见文件头说明）。宁可下拉是空的。
+                state.models.length === 0
+                  ? h('option', { key: 'none', value: '' }, state.modelsLoaded === true ? '（无可用模型）' : '正在读取模型列表…')
+                  : state.models.map((model) => {
+                      const value = modelOptionValue(model);
+                      return h('option', { key: value, value }, String(model.name || model.id))
+                    }),
               ),
             ),
             h(
@@ -2421,21 +3610,42 @@ window.__ModuleLoader__.load({
               {
                 type: 'button',
                 className: 'asov_button asov_button_primary',
-                disabled: state.generating,
+                // 目录未就绪 / 目录为空 / 选中值解析不出路由 → 一律禁用。
+                // 这是「不点了没反应」的正解：按钮的可用状态直接反映「现在能不能生成」。
+                disabled: state.generating || canResolveRoute(state.model, state.models) === null,
+                title: canResolveRoute(state.model, state.models) === null
+                  ? (state.models.length === 0
+                    ? '模型目录未就绪或为空，暂时无法生成（不会发出注定失败的请求）'
+                    : '当前选中的模型无法解析成路由，请先在下拉里选择一个具体模型')
+                  : '用所选模型为每个工作区生成总结（会调用模型、产生 token）',
                 onClick: onGenerate,
               },
-              state.generating ? '生成中…' : '立即生成',
+              state.generating
+                ? '生成中…'
+                : (canResolveRoute(state.model, state.models) === null
+                  ? (state.models.length === 0
+                    ? (state.modelsLoaded === true ? '模型服务不可用' : '正在读取模型列表…')
+                    : '请选择具体模型')
+                  : '立即生成'),
             ),
           ),
         );
 
         const notices = [];
-        if (state.modelsPlaceholder) {
+        if (state.modelsLoaded === true && state.models.length === 0) {
+          // 这是**真故障**（llm 服务不可用 → 没有模型目录 → 生成不了），必须常驻可见。
+          // 旧的「模型列表为占位」文案是误导：占位表已删除（它是死路），现在是真的没有模型。
           notices.push(
             h(
               'div',
-              { className: 'asov_notice', key: 'models' },
-              '模型列表为占位：端点未返回 models 字段。实际接入应由集成层复用 DSH 既有模型目录（modelCatalog）。',
+              { className: 'asov_notice asov_notice_error', key: 'models', role: 'alert' },
+              h('div', { className: 'asov_notice_errorTitle' }, '模型服务不可用'),
+              h(
+                'div',
+                { className: 'asov_notice_errorBody' },
+                '端点未返回任何可用模型（operation=listModels error_code=MODEL_CATALOG_EMPTY），' +
+                  '「立即生成」已禁用。请检查 dsh-llm 服务；下方工作区列表不受影响。',
+              ),
             ),
           );
         }
@@ -2451,28 +3661,63 @@ window.__ModuleLoader__.load({
           );
         }
         // 服务端 warnings 是**完整诊断串**（[operation] target -> CODE: message {context}），
-        // 实测单条 100~200 字符，5 条就能占满首屏；且其中大部分是「按上限截断」
-        // 「丢弃非绝对 cwd」这类**预期行为**，逐条铺开会让人误以为插件出错。
-        // 这里：先按 error_code 合并同类说明性提示，剩余单条只显示摘要，
-        // 完整原串统一进 title（悬停可见），详见 buildWarningNotices。
-        for (const notice of buildWarningNotices(warnings)) {
+        // 实测单条 100~200 字符；且其中大部分是「按上限截断」「丢弃非绝对 cwd」
+        // 「会话无日志」这类**预期行为**（用户原话：「要么解决要么别提示」）。
+        // 分流规则见 classifyWarnings：
+        //   · 预期项 → 全部收进**默认收起的 <details>**，界面上只常驻一行标题；
+        //   · 真故障 → 与之前一致地常驻可见，绝不折叠、绝不丢弃。
+        const classified = classifyWarnings(warnings);
+        for (const notice of classified.faults) {
           notices.push(h(NoticeWarn, { key: notice.key, text: notice.text, detail: notice.detail }));
+        }
+        if (classified.notes.length > 0) {
+          notices.push(h(NoticeNotes, { key: 'notes', items: classified.notes }));
+        }
+
+        // ── Bug 2（2026-10-06，用户实测）：出错后整个工作区列表消失 ──
+        // 此前只要 state.error 非空就整页替换 body，把列表顶掉；
+        // 「立即生成」一次 404 就让用户以为插件整体坏了（其实 GET 的数据一直都在）。
+        //
+        // ⚠️ 这里必须**区分两类错误**，不能一刀切都改成提示条：
+        //   status === 'error'          → GET 没拿到数据（读取/网络/解析失败），
+        //                                   此时根本没有列表可显示，仍应整页错误；
+        //   status === 'ready' 且有 error → 只有 POST「立即生成」失败，
+        //                                   GET 早已把列表取回来了 → **必须保留列表**，
+        //                                   错误降级为顶部提示条。
+        const readFailed = state.status === 'error';
+        if (readFailed === false && typeof state.error === 'string' && state.error !== '') {
+          notices.unshift(
+            h(
+              'div',
+              { className: 'asov_notice asov_notice_error', key: 'error', role: 'alert' },
+              h('div', { className: 'asov_notice_errorTitle' }, '操作失败（下方列表不受影响）'),
+              h('div', { className: 'asov_notice_errorBody' }, state.error),
+            ),
+          );
         }
 
         let body;
-        if (state.status === 'error') {
+        if (readFailed) {
           body = h('div', { className: 'asov_error' }, String(state.error));
         } else if (state.status === 'loading' && workspaces.length === 0) {
           body = h('div', { className: 'asov_empty' }, h('div', { className: 'asov_empty_main' }, '正在读取工作区…'));
-        } else if (state.error !== null && state.error !== undefined && state.error !== '') {
-          body = h('div', { className: 'asov_error' }, String(state.error));
         } else if (workspaces.length === 0) {
-          body = h(
-            'div',
-            { className: 'asov_empty' },
-            h('div', { className: 'asov_empty_main' }, '没有扫描到任何工作区笔记'),
-            h('div', null, '确认工作区里存在 tasks/ 或 .agents/notes/ 目录后重试。'),
-          );
+          // 「全被隐藏」与「真的没有工作区」是两件事，**必须**给不同文案。
+          // 混为一谈会让用户以为工作区丢了（他刚刚才亲手点的隐藏）。
+          body = hiddenList.length > 0
+            ? h(
+                'div',
+                { className: 'asov_empty' },
+                h('div', { className: 'asov_empty_main' }, '所有工作区都已从本页隐藏（' + String(hiddenList.length) + ' 个）'),
+                h('div', null, '用上方工具栏的「已隐藏（' + String(hiddenList.length) + '）」展开即可逐个恢复。'),
+                h('div', null, 'DSH 的工作区、侧栏与会话记录全程未受影响。'),
+              )
+            : h(
+                'div',
+                { className: 'asov_empty' },
+                h('div', { className: 'asov_empty_main' }, '没有扫描到任何工作区笔记'),
+                h('div', null, '确认工作区里存在 tasks/ 或 .agents/notes/ 目录后重试。'),
+              );
         } else {
           body = workspaces.map((workspace) => {
             const files = Array.isArray(workspace.files) ? workspace.files : [];
@@ -2500,6 +3745,20 @@ window.__ModuleLoader__.load({
                   'span',
                   { className: 'asov_ws_meta' },
                   files.length + ' 文件 · ' + humanBytes(workspace.totalBytes),
+                ),
+                // ── 隐藏按钮（2026-10-07）──────────────────────────────────────
+                // 文案必须是「隐藏」而不是「删除」：删掉的是本页的显示，
+                // 不是 DSH 的工作区。title 里把边界写死，防止用户误读。
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'asov_hideBtn',
+                    disabled: pendingCwd !== '',
+                    title: '只从「工作总览」这一页隐藏这个工作区；DSH 的工作区、侧栏、会话记录与文件都不受影响，可随时恢复',
+                    onClick: () => onToggleHidden(String(workspace.cwd), true),
+                  },
+                  pendingCwd === String(workspace.cwd) ? '隐藏中…' : '隐藏',
                 ),
               ),
               h(
@@ -2561,13 +3820,28 @@ window.__ModuleLoader__.load({
         );
       }
 
-      return { Component: WorkOverviewView, apply: apply, internals: { summarizeWarning, parseWarningLine, buildWarningNotices, NoticeWarn } };
+      return {
+        Component: WorkOverviewView,
+        apply: apply,
+        internals: {
+          summarizeWarning, parseWarningLine, classifyWarnings, EXPECTED_WARNING_GROUPS,
+          NoticeWarn, NoticeNotes,
+          // 问题 A 的模型防线（供单测直接单测，不依赖 React 渲染）
+          modelOptionValue, canResolveRoute, resolveSelectedModel,
+          // 隐藏工作区（2026-10-07）：确认框文案是本功能唯一的语义说明书，必须可测。
+          hiddenConfirmText,
+        },
+      };
     }
       return createOverviewUi
     })()
     const sidebarUi = createSidebarUi({ React })
     const overviewUi = createOverviewUi({ React })
-    const inject = ['slots']
+    // ⚠️ 这一行才是**真正导出给 DI 的 inject**（见下方 return）。
+    // ui/sidebar.js 里那个 export const inject 内联后落在 IIFE 作用域内，对 DI 完全不起作用。
+    // 2026-10-06：加 'layout' —— Bug 3 修法需要在 main 面板挂载时调 ctx.layout.selectPanel(null)
+    // 把中央列交还给对话（只返回 null 不够，见 ui/sidebar.js 的 MainSlotHost 说明）。
+    const inject = ['slots', 'layout']
     function apply(ctx) {
       sidebarUi.apply(ctx)
       overviewUi.apply(ctx)

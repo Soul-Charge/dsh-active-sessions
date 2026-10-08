@@ -311,6 +311,82 @@ export function listSessionLogs(rootDir, warnings = []) {
 }
 
 /**
+ * 建「会话目录名 -> 会话日志 mtime(ms)」的全量索引。
+ *
+ * 为什么要它、为什么不能复用 listSessionLogs：
+ *   listSessionLogs 按 mtime 降序返回并让调用方按 limit 截断（审批扫描默认只扫 60 个），
+ *   而 states.js 判「运行中」需要**每一个**会话的日志新鲜度 —— 漏掉的恰好就是僵尸会话
+ *   （它们最旧，一定排在 limit 窗口之外）。所以这里独立走一遍：只 stat，不解压、不读内容。
+ *
+ * 实测成本（本机 2026-10-06）：509 个会话 / 513 个日志文件，全量索引 **19ms**。
+ * 因为只是一次 readdir + 一次 stat，没有 zstd 解压，所以可以每轮扫描都重算，不必缓存。
+ *
+ * 两种文件名都要匹配（session.v3.jsonl.zstd 新 / session.jsonl.zstd 旧）——
+ * LOG_FILE_RE 已覆盖，实测两条 40~51 天前的僵尸会话用的正是旧命名。
+ *
+ * 键是**会话目录名原样**（既可能是裸 uuid，也可能是 session-<uuid>），
+ * 调用方必须用候选集（states.js 的 sessionIdCandidates）来查，不能直接字符串相等。
+ *
+ * @param {string} rootDir 会话根目录，默认 ~/.dsh/sessions
+ * @param {string[]} [warnings] 出参：目录不可读等非致命问题
+ * @returns {{index: Map<string, number>, files: number, elapsedMs: number}}
+ */
+export function buildSessionLogMtimeIndex(rootDir, warnings = []) {
+  const sink = Array.isArray(warnings) ? warnings : []
+  const startedAt = Date.now()
+  /** @type {Map<string, number>} */
+  const index = new Map()
+  let files = 0
+  const walk = (dir, depth) => {
+    let entries
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && sink.length < MAX_WARNINGS) {
+        sink.push(describeIssue('列出目录', dir, error?.code ?? error?.name ?? 'EUNKNOWN', { message: String(error?.message ?? error).slice(0, 200), depth }))
+      }
+      return
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      let isDirectory = entry.isDirectory()
+      let isFile = entry.isFile()
+      if (!isDirectory && !isFile && entry.isSymbolicLink()) {
+        try {
+          const stat = fs.statSync(full)
+          isDirectory = stat.isDirectory()
+          isFile = stat.isFile()
+        } catch {
+          continue
+        }
+      }
+      if (isDirectory) {
+        if (depth < MAX_DEPTH) walk(full, depth + 1)
+        continue
+      }
+      if (!isFile || !LOG_FILE_RE.test(entry.name)) continue
+      files += 1
+      // 会话 id 取**父目录名**：结构固定为 <workspace扁平名>/<sessionId>/<file>。
+      const sessionId = path.basename(dir)
+      try {
+        const stat = fs.statSync(full)
+        // 同一会话可能有多个日志文件（v3 与旧版并存），取最新 mtime：
+        // 只要有一个还在写，这个会话就是活的。
+        const previous = index.get(sessionId)
+        if (previous === undefined || previous < stat.mtimeMs) index.set(sessionId, stat.mtimeMs)
+      } catch (error) {
+        if (sink.length < MAX_WARNINGS) {
+          sink.push(describeIssue('读取文件元数据', full, error?.code ?? error?.name ?? 'EUNKNOWN', { message: String(error?.message ?? error).slice(0, 200) }))
+        }
+      }
+    }
+  }
+  const root = typeof rootDir === 'string' && rootDir !== '' ? rootDir : defaultSessionsRoot()
+  walk(root, 0)
+  return { index, files, elapsedMs: Date.now() - startedAt }
+}
+
+/**
  * 解析 limit 选项。
  * 为什么这样定：非有限值（Infinity/NaN）或 <=0 一律解释成"不截断"。
  * 因为 0 更可能被调用方用来表达"全部"而不是"一个都不扫"；截断本身只是性能优化，

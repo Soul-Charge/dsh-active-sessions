@@ -54,6 +54,13 @@ const POLL_MIN_MS = 15000
 const STORAGE_KEY = 'dsh-active-sessions.collapsed'
 const GEOMETRY_KEY = 'dsh-active-sessions.geometry'
 const LOCKED_KEY = 'dsh-active-sessions.locked'
+/**
+ * 「已完成未查看」时间筛选的持久化键（问题二）。
+ * 取值 'recent'（默认，最近 7 天）| 'all'（有史以来）。沿用既有 dsh-active-sessions.* 命名。
+ */
+export const UNSEEN_FILTER_KEY = 'dsh-active-sessions.unseenFilter'
+/** 「全部标记已读」按钮文案里用的天数，必须与默认筛选窗口一致。 */
+export const UNSEEN_RECENT_DAYS = 7
 /** 宽度范围：下界保证标题栏三个按钮不挤爆，上界避免吃掉主内容。 */
 const OVERLAY_MIN_WIDTH = 180
 const OVERLAY_MAX_WIDTH = 420
@@ -88,6 +95,14 @@ const HOST_HEADER_MIN_W = 600
 const PLUGIN_ID = 'dsh-active-sessions'
 /** 跨插件选中会话的解耦事件名（不写死到别人的导航接口里）。 */
 const SELECT_EVENT = 'dsh-active-sessions:select'
+/**
+ * 跳转失败事件（2026-10-07 新增）。
+ *
+ * 为什么需要：selectEntry 的返回值**没有任何调用方消费**，导致「点击卡片但没跳转」
+ * 在界面上完全不可见 —— 真机验收时点卡片毫无反应、控制台也没有任何告警，
+ * 用户只能认为插件坏了却无法反馈。失败必须显式派发成事件，由 UI 层渲染成提示条。
+ */
+const NAVIGATION_EVENT = 'dsh-active-sessions:navigation-failed'
 /** 模块 id（宿主模块加载器的 id 字段；工厂本身不写包裹层，仅作常量）。 */
 const MODULE_ID = 'dsh-active-sessions/sidebar'
 const CSS_TAG = PLUGIN_ID + '/sidebar.css'
@@ -123,6 +138,7 @@ export const constants = {
   OVERLAY_GAP,
   OVERLAY_TOP_FALLBACK,
   SELECT_EVENT,
+  NAVIGATION_EVENT,
   CSS_TAG,
 }
 
@@ -664,12 +680,300 @@ export function reportSeen(sessionId, options) {
   )
 }
 
+/* ──────────────────── unseen 时间筛选（问题二） ──────────────────── */
+
+/**
+ * 读「已完成未查看」的时间筛选。默认 **'recent' = 最近 7 天**（用户 2026-10-06 决策）。
+ *
+ * 为什么默认收窄：实测本机服务端「有史以来」口径下 unseen 有 484 条
+ * （0-7 天 115 / 7-30 天 236 / 30-180 天 125 / 180 天以上 8），一屏根本看不过来，
+ * 而用户真正关心的是「刚做完没看的那几件事」。
+ *
+ * 为什么筛选放在**客户端**而不是服务端：
+ *   1) 服务端仍返回全量 unseen，「切到全部」才不需要重扫（506 个投影文件约 1 秒）；
+ *   2) counts 是全量口径的统计值，若在服务端过滤，counts.unseen 会与列表长度对不上，
+ *      反而制造新的不一致（验收第 2 条要求计数可对账）；
+ *   3) 筛选是**这一屏的阅读偏好**，不是数据事实 —— 放 localStorage 刷新后还在，换机器不跟随。
+ */
+export function readUnseenFilter() {
+  try {
+    if (typeof localStorage === 'undefined' || localStorage === null) return 'recent'
+    const raw = localStorage.getItem(UNSEEN_FILTER_KEY)
+    return raw === 'all' ? 'all' : 'recent'
+  } catch (cause) {
+    warnOnce('readUnseenFilter', 'localStorage 不可读，按默认「最近 7 天」处理：' + describeError(cause))
+    return 'recent'
+  }
+}
+
+/** 写 unseen 筛选。任何非 'all' 的值都归一成 'recent'（默认档）。 */
+export function writeUnseenFilter(filter) {
+  const next = filter === 'all' ? 'all' : 'recent'
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage !== null) {
+      localStorage.setItem(UNSEEN_FILTER_KEY, next)
+    }
+  } catch (cause) {
+    warnOnce('writeUnseenFilter', 'localStorage 不可写，本次筛选不持久化：' + describeError(cause))
+  }
+  return next
+}
+
+/**
+ * 按筛选把 unseen 条目切成「显示 / 隐藏」。
+ *
+ * 时间基准是 **lastPromptAt**（用户最后一次提问的时刻），不是 generatedAt、也不是投影 createdAt：
+ * unseen 的语义是「已完成但你没看」，用户关心的是「我什么时候做的」，
+ * lastPromptAt 正是那一刻。边界用严格大于（> cutoff）：恰好 7 天整的点算「更早」。
+ *
+ * @param {Array} entries 全部 unseen 条目
+ * @param {'recent'|'all'} filter
+ * @param {number} now 注入的时间源（单测可冻结）
+ * @returns {{visible: Array, hidden: number, cutoff: number}}
+ */
+export function partitionUnseen(entries, filter, now) {
+  const list = Array.isArray(entries) ? entries : []
+  const at = num(now)
+  if (filter === 'all') return { visible: list.slice(), hidden: 0, cutoff: 0 }
+  const cutoff = at - UNSEEN_RECENT_DAYS * 24 * 3600 * 1000
+  const visible = []
+  let hidden = 0
+  for (const entry of list) {
+    const at2 = asRecord(entry) === null ? 0 : num(entry.lastPromptAt)
+    if (at2 > cutoff) visible.push(entry)
+    else hidden += 1
+  }
+  return { visible: visible, hidden: hidden, cutoff: cutoff }
+}
+
+/**
+ * 批量「全部标记已读」。
+ *
+ * 为什么走**一条** POST（{sessionIds:[...]}）而不是逐条：
+ * 实测过滤后仍有 115~484 条，逐条意味着一次点击打出上百个请求，中途断连就留下半清不清的列表。
+ * 服务端复用同一条 /seen 路由（rpc.js 的批量分支），既不新增路由（冻结契约只有 4 条），
+ * 水位语义也与单条完全一致（取 max、只前进不后退）。
+ *
+ * @param {string[]} ids 当前筛选范围内的会话 id
+ * @param {{endpoint?:string, fetch?:Function}} [options] 测试注入
+ * @returns {Promise<{ok:boolean, applied:number, errorCode?:string}>}
+ */
+export function markAllSeen(ids, options) {
+  const list = Array.isArray(ids) ? ids.filter((x) => typeof x === 'string' && x !== '') : []
+  if (list.length === 0) return Promise.resolve({ ok: true, applied: 0 })
+  const config = asRecord(options) === null ? {} : options
+  const endpoint = str(config.endpoint) !== '' ? str(config.endpoint) : SEEN_ENDPOINT
+  const doFetch = config.fetch === undefined ? (typeof fetch === 'function' ? fetch : null) : config.fetch
+  if (typeof doFetch !== 'function') {
+    warnOnce('markAllSeen:noFetch', '没有可用的 fetch，批量标记已读未发出')
+    return Promise.resolve({ ok: false, applied: 0, errorCode: 'NO_FETCH' })
+  }
+  let body
+  try {
+    body = JSON.stringify({ sessionIds: list, at: Date.now() })
+  } catch (cause) {
+    warnOnce('markAllSeen:body', '构造批量请求体失败（跳过本次标记）：' + describeError(cause))
+    return Promise.resolve({ ok: false, applied: 0, errorCode: 'BODY_SERIALIZE_FAILED' })
+  }
+  // 一次性打上百个 id 可能超出 body 上限；超限时明确报错而不是静默截断。
+  if (body.length > 60000) {
+    warnOnce('markAllSeen:tooLarge', '批量标记已读超出请求体上限（' + String(body.length) + ' 字符），请改用更小的筛选范围')
+    return Promise.resolve({ ok: false, applied: 0, errorCode: 'PAYLOAD_TOO_LARGE' })
+  }
+  let promise
+  try {
+    promise = doFetch(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: body,
+      keepalive: true,
+    })
+  } catch (cause) {
+    warnOnce('markAllSeen:call', '批量标记已读调用失败：' + describeError(cause))
+    return Promise.resolve({ ok: false, applied: 0, errorCode: 'FETCH_THREW' })
+  }
+  return Promise.resolve(promise).then(
+    (res) => {
+      if (res === null || res === undefined || res.ok === false) {
+        warnOnce('markAllSeen:http', '批量标记已读返回非 2xx')
+        return { ok: false, applied: 0, errorCode: 'HTTP_FAILED' }
+      }
+      return res.json().then(
+        (payload) => {
+          const outer = asRecord(payload)
+          const data = asRecord(outer === null ? null : outer.data)
+          return { ok: true, applied: num(data === null ? 0 : data.applied) }
+        },
+        (cause) => {
+          warnOnce('markAllSeen:json', '批量标记已读响应不是 JSON：' + describeError(cause))
+          return { ok: true, applied: 0 }
+        },
+      )
+    },
+    (cause) => {
+      warnOnce('markAllSeen:reject', '批量标记已读未完成（下轮轮询会重算）：' + describeError(cause))
+      return { ok: false, applied: 0, errorCode: 'REJECTED' }
+    },
+  )
+}
+
+/* ──────────────────── 宿主会话跳转面（问题三） ──────────────────── */
+
+/**
+ * uiWorkspace 服务（宿主跨插件动作面）。
+ *
+ * 2026-10-06 实测根因：selectEntry 只 dispatchEvent('dsh-active-sessions:select')，
+ * 而**全仓库没有任何监听者** → 点击卡片毫无反应。
+ *
+ * 宿主的正确入口（官方侧栏就是这么用的，见
+ * @deepseek-ai/dsh-client-ui-sidebar/lib/client.js:329-339）：
+ *   inject 里含 'uiWorkspace'，apply 里 const workspaceNavigation = ctx.get('uiWorkspace')
+ *   然后 workspaceNavigation.openSession(sessionId)
+ * openSession 内部 = sessions.open(id) + ctx.layout.selectPanel(null)。
+ *
+ * 为什么**不**把 'uiWorkspace' 加进本包的 inject（结论：可选获取 + 缺失降级）：
+ *   cordis 的 ctx.get(name) 在服务缺席时返回 **undefined**（cordis/lib/index.js:762-764
+ *   get(name, strict) { return getTraceable(this.ctx, this._getImpl(name, strict)?.value) }），
+ *   所以「可选获取 + 缺失降级」是**安全**的；
+ *   而 inject 是硬依赖：服务没被 provide 时整个 fiber 停在 pending，四个挂载点全部注册不上，
+ *   面板直接消失。本包是独立 sideload 的客户端包，宿主换版本/换 platform（web vs 非 web）时
+ *   ui-workspace bundle 未必在，白拿一个「整包不加载」的风险不值得。
+ *   与 models.js 用 ctx.get('llm') 同理（官方有 11 处先例，均不进 inject）。
+ */
+let workspaceFace = null
+
+/**
+ * 惰性解析器：apply 时只记住 ctx，**每次点击时**再向宿主要 uiWorkspace。
+ *
+ * ⚠️ 2026-10-07 实测根因（浏览器真机验收发现的真 bug）：
+ *   原实现在 apply() 里一次性 `ctx.get('uiWorkspace')` 并缓存。但 cordis 的
+ *   `get(name, strict = true)` 在**提供者 fiber 尚未激活**时返回 undefined：
+ *       _getImpl(name, strict) { if (strict && impl.fiber.state !== 2) return; ... }
+ *   本包是 sideload 客户端包，inject 只有 ['slots','layout']，**不含 uiWorkspace**
+ *   （刻意不加：inject 是硬依赖，缺了会让整包 pending、四个挂载点全注册不上）。
+ *   于是 apply() 跑得比 ui-workspace 的 fiber 激活更早 → 拿到 undefined 并永久缓存，
+ *   点击时走 "UIWORKSPACE_MISSING" 分支 —— 而 selectEntry 的返回值**无人消费**，
+ *   失败完全静默：用户点卡片毫无反应，控制台也没有任何告警。
+ *
+ * 修法：把「取服务」推迟到点击那一刻（那时所有 fiber 早已激活），
+ * 并且只在成功时缓存；未取到时下次点击重试，不会把一次过早的 undefined 永久固化。
+ */
+let workspaceResolver = null
+
+/**
+ * 记下解析器（apply 时传入一个返回 uiWorkspace 或 null 的闭包）。
+ * 兼容旧签名：传一个非函数对象视为「直接绑定该 face」。
+ */
+export function bindWorkspaceFace(faceOrResolver) {
+  if (typeof faceOrResolver === 'function') {
+    workspaceResolver = faceOrResolver
+    return
+  }
+  workspaceResolver = null
+  workspaceFace = asRecord(faceOrResolver) === null ? null : faceOrResolver
+}
+
+/**
+ * 取当前可用的 uiWorkspace。
+ * 优先用惰性解析器（点击时实名求值），成功即缓存；失败不缓存，下次再试。
+ * @returns {object|null}
+ */
+export function resolveWorkspaceFace() {
+  if (workspaceFace !== null) return workspaceFace
+  if (workspaceResolver === null) return null
+  let face = null
+  try {
+    face = workspaceResolver()
+  } catch (cause) {
+    // 解析器抛错不该影响点击：降级为「无跳转面」，但必须留痕可诊断。
+    if (typeof console !== 'undefined' && console !== null && typeof console.warn === 'function') {
+      console.warn('[active-sessions/sidebar] 解析 uiWorkspace 失败: ' + describeError(cause))
+    }
+    return null
+  }
+  const normalized = asRecord(face) === null ? null : face
+  if (normalized !== null) workspaceFace = normalized
+  return normalized
+}
+
+/** 清空缓存（供自测在两次场景间复位）。 */
+export function resetWorkspaceFace() {
+  workspaceFace = null
+  workspaceResolver = null
+}
+
+/** 当前是否已绑定可用的跳转面（供自测断言降级路径）。 */
+export function hasWorkspaceFace() {
+  return workspaceFace !== null
+}
+
+/**
+ * 会话 id 形态归一：宿主 sessions.select() 只认它自己目录里的写法，
+ * 写错会直接抛 "sessions.select: unknown session &lt;id&gt;"。
+ *
+ * 实测本机两种写法都真实存在：
+ *   - workspace.json 的 sessionIds：379 条里 372 条带 'session-' 前缀，7 条是裸 uuid；
+ *   - 投影文件名：老会话裸 uuid，新会话带前缀（506 个文件两种都有）。
+ * 所以先按调用方给的原样试一次，失败再试另一种形态。
+ */
+function sessionIdForms(id) {
+  const text = str(id)
+  if (text === '') return []
+  const bare = text.indexOf('session-') === 0 ? text.slice('session-'.length) : text
+  const forms = [text]
+  if (bare !== '' && bare !== text) forms.push(bare)
+  if (text.indexOf('session-') !== 0) forms.push('session-' + text)
+  return forms
+}
+
+/**
+ * 真正跳转到宿主会话。
+ *
+ * @returns {{opened:boolean, reason?:string, errorCode?:string}}
+ *   opened=false 时 reason 是可诊断的一行文案（界面会把它显示成一条提示条）。
+ *
+ * 覆盖子代理会话：宿主的 sessions.select() 支持 catalog-addressed child
+ * （dsh-api-session-controller/lib/client.js:2257-2261 会先 navigationAddress() 再按目录选），
+ * 所以子代理会话也是一等可打开对象，我们不预先拦它；但它可能不在当前已发现的目录里，
+ * 此时 select() 会抛 —— 已由下面的 try/catch 降级，绝不崩。
+ */
+export function openSessionInHost(id) {
+  // 点击那一刻才向宿主要服务 —— 见 resolveWorkspaceFace 上方的实测根因说明。
+  const face = resolveWorkspaceFace()
+  if (face === null) {
+    return { opened: false, reason: '宿主未提供 uiWorkspace 服务（跳转到会话不可用）', errorCode: 'UIWORKSPACE_MISSING' }
+  }
+  if (typeof face.openSession !== 'function') {
+    return { opened: false, reason: 'uiWorkspace 缺少 openSession 方法', errorCode: 'UIWORKSPACE_NO_OPEN' }
+  }
+  const forms = sessionIdForms(id)
+  if (forms.length === 0) return { opened: false, reason: '会话 id 为空', errorCode: 'EMPTY_SESSION_ID' }
+  let lastError = null
+  for (let i = 0; i < forms.length; i += 1) {
+    try {
+      face.openSession(forms[i])
+      return { opened: true }
+    } catch (cause) {
+      lastError = cause
+    }
+  }
+  return {
+    opened: false,
+    reason: '打开会话失败：' + describeError(lastError),
+    errorCode: 'OPEN_SESSION_FAILED',
+  }
+}
+
 /**
  * 选中某个会话时上报。
  * 不写死任何导航接口：优先调用集成方传入的 onSelect；否则派发自定义事件，
  * 让「谁负责切会话」自己去监听，客户端包之间保持解耦。
  *
  * 同时上报已读水位（见 reportSeen 的说明）—— 这是 unseen 状态能清掉的唯一途径。
+ *
+ * 2026-10-06（问题三）：在上述两条之外**新增** uiWorkspace.openSession 跳转。
+ * 顺序刻意是「先跳转、后派发」：导航是用户点击的主要期望，派发只是向后兼容的旁路。
+ * 跳转失败不阻断派发（向后兼容优先），但会返回 reason 让界面能给出可诊断提示。
  */
 export function selectEntry(entry, onSelect) {
   if (entry !== null && entry !== undefined) {
@@ -677,13 +981,30 @@ export function selectEntry(entry, onSelect) {
     const seenOptions = typeof onSelect === 'object' && onSelect !== null ? onSelect : undefined
     void reportSeen(entry.id, seenOptions).catch(() => false)
   }
+  let nav = { opened: false, reason: '由外部 onSelect 接管导航', errorCode: 'ONSELECT_TAKEOVER' }
+  // onSelect 是集成方自己的导航通道（老契约："不写死任何导航接口"）。
+  // 它在场时**不**再去抢宿主跳转 —— 否则一次点击会触发两套导航，互相打架。
+  if (typeof onSelect !== 'function' && entry !== null && entry !== undefined) {
+    nav = openSessionInHost(entry.id)
+  }
+  // ⚠️ 2026-10-07：原实现把 nav 只当返回值——而**没有任何调用方消费它**，
+  // 于是「跳转失败」在界面上完全不可见（真机验收时点卡片毫无反应、控制台也无告警）。
+  // 跳转失败必须显式暴露，否则用户只会以为插件坏了却无从反馈。
+  // 注意：成功时**不**派发任何提示（避免每次点击都闪一条）。
+  if (nav.opened !== true && typeof window !== 'undefined' && window !== null &&
+      typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+    window.dispatchEvent(new CustomEvent(NAVIGATION_EVENT, {
+      detail: { id: entry === null || entry === undefined ? '' : entry.id, opened: false, reason: nav.reason, errorCode: nav.errorCode },
+    }))
+  }
   if (typeof onSelect === 'function') {
     onSelect(entry.id, entry)
-    return
+    return nav
   }
-  if (typeof window === 'undefined' || window === null) return
-  if (typeof window.dispatchEvent !== 'function' || typeof CustomEvent !== 'function') return
+  if (typeof window === 'undefined' || window === null) return nav
+  if (typeof window.dispatchEvent !== 'function' || typeof CustomEvent !== 'function') return nav
   window.dispatchEvent(new CustomEvent(SELECT_EVENT, { detail: { id: entry.id, cwd: entry.cwd, workspace: entry.workspace } }))
+  return nav
 }
 
 // ───────────────────────── 样式 ─────────────────────────
@@ -715,6 +1036,19 @@ export const CSS = [
   '.as_foldBtn{width:100%;text-align:left;border:1px dashed var(--as-line);background:transparent;',
   'color:var(--as-tertiary);font-size:11.5px;padding:5px 8px;border-radius:8px;cursor:pointer;font-family:inherit}',
   '.as_foldBtn:hover{background:var(--as-card);color:var(--as-text2)}',
+// ── 问题二：unseen 时间筛选条 ─────────────────────────────────────────
+// 同样刻意只用半透明实色（as-card），不加任何背景模糊（列容器硬约束，见文件头）。
+// ⚠️ 本文件对该 CSS 属性名的 grep 必须是 0 命中，**注释里也不要写它**，否则验收脚本会误判。
+'.as_filterBar{display:flex;align-items:center;gap:4px;flex-wrap:wrap;padding:4px 6px;',
+'border-top:1px solid var(--as-line);border-bottom:1px solid var(--as-line);background:var(--as-card)}',
+'.as_filterLabel{font-size:11.5px;color:var(--as-tertiary);white-space:nowrap}',
+'.as_filterBtn{font:inherit;font-size:11px;line-height:1.4;padding:3px 7px;border-radius:7px;cursor:pointer;',
+'border:1px solid var(--as-line);background:transparent;color:var(--as-text2);white-space:nowrap}',
+'.as_filterBtn:hover{background:var(--as-accent-bg);color:var(--as-text)}',
+'.as_filterBtn_on{background:var(--as-accent-bg);border-color:var(--as-accent-line);color:var(--as-accent);font-weight:600}',
+'.as_filterBtn_action{border-color:var(--as-accent-line);color:var(--as-accent)}',
+'.as_filterBtn_action[disabled]{opacity:.55;cursor:progress}',
+'.as_filterHint{padding:3px 8px;font-size:11px;color:var(--as-tertiary)}',
   // ── overlay 挂载形态（shell.overlay）──────────────────────────────
   // shell.overlay 是 absolute/inset:0/pointer-events:none 的帧级浮层（点击穿透），
   // 里面的元素必须自己 opt-in pointer-events:auto，否则整窗点不动。
@@ -811,6 +1145,13 @@ export const CSS = [
   '.as_iconBtn_on{color:var(--as-accent);border-color:var(--as-accent-line);background:var(--as-accent-bg)}',
   '.as_warn{padding:6px 12px;font-size:11px;color:var(--as-appr);background:var(--as-appr-bg);',
   'border-bottom:1px solid var(--as-line)}',
+  // 说明性提示的折叠块（2026-10-07）：默认收起 → 只占一行，不再常驻刷屏。
+  '.as_warnNotes{padding:6px 12px;font-size:11px;color:var(--as-tertiary);',
+  'border-bottom:1px dashed var(--as-line);cursor:pointer}',
+  '.as_warnNotes_summary{outline:none;user-select:none}',
+  '.as_warnNotes_summary:hover{color:var(--as-text2)}',
+  '.as_warnNotes_list{margin:6px 0 2px;padding-left:16px;display:flex;flex-direction:column;gap:3px}',
+  '.as_warnNotes_item{line-height:16px;word-break:break-word}',
   '.as_body{flex:1;min-height:0;overflow:auto;padding:10px}',
   '.as_group{margin-bottom:11px}',
   '.as_group:last-child{margin-bottom:2px}',
@@ -1194,30 +1535,188 @@ export function createSidebarUi(options) {
     )
   }
 
-  /** 非致命提示条（端点未就绪、服务端 warnings 等）。 */
+  // -------------------------------------------------------------------------
+  // 警告的「预期 vs 故障」判定（2026-10-07，用户实测「左窗底部两条噪音」）
+  // -------------------------------------------------------------------------
+  // ⚠️ 左窗此前之所以逐条刷屏（用户截图里那两条），是因为服务端 states.js 产出的是
+  //   `[states] operation=… error_code=Error` 的 key=value 串，与总览页 warnLine 的
+  //   ' -> CODE:' 形态对不上 → 归类全部落空 → 一条条 push。
+  //   **根本修法在服务端**：states.js 的 describeError 现在产出同一形态，
+  //   并且带**真实** error_code（SESSION_LOG_MISSING / CWD_NOT_ABSOLUTE …），
+  //   前端据此区分「预期降级」与「真故障」，不再做字符串猜测。
+  //
+  // ⚠️ 本段与 ui/overview.js 的同名实现**逐字一致**。两个 UI 是分别内联进 client.js 的
+  //   独立工厂（DSH 客户端 require 不了同包子路径），所以只能各写一份；
+  //   tests/temp-e2e-warning-groups.mjs 对两份实现跑同一组夹具并断言输出一致，
+  //   防止「改了一边忘了另一边」。
+  // -------------------------------------------------------------------------
+
+  /**
+   * 解析服务端诊断串的**规范格式**：
+   *     [operation] target -> ERROR_CODE: message {contextJson}
+   *
+   * 为什么不用一条正则：message 里可能含花括号，惰性分组会把 message 截断、
+   * 并把 message 的一段误当成 context。改成**从右往左**找可 JSON.parse 的尾段 ——
+   * context 永远是最后一段且必然是合法 JSON，判定无歧义且确定。
+   * 解析不出返回 null，调用方按「无法证明是预期行为」处理（fail-safe：宁可多显示）。
+   */
+  function parseWarningLine(raw) {
+    const text = str(raw)
+    if (text === '') return null
+    const head = text.match(/^\[([^\]]*)\]\s*([\s\S]*)$/)
+    if (head === null || head === undefined) return null
+    const operation = str(head[1])
+    const rest = str(head[2])
+
+    // target 与 CODE 之间用 ' -> ' 分隔；取**最后一个**，避免路径里的箭头串位。
+    const arrow = rest.lastIndexOf(' -> ')
+    if (arrow <= 0) return null
+    const target = rest.slice(0, arrow).trim()
+    const tail = rest.slice(arrow + 4).trim()
+
+    const codeMatch = tail.match(/^([A-Za-z0-9_]+)\s*([\s\S]*)$/)
+    if (codeMatch === null || codeMatch === undefined) return null
+    const code = str(codeMatch[1])
+    let body = str(codeMatch[2]).trim()
+    if (body.startsWith(':')) body = body.slice(1).trim()
+
+    let context = ''
+    let message = body
+    for (let i = body.lastIndexOf('{'); i >= 0; i = body.lastIndexOf('{', i - 1)) {
+      if (i <= 0) break
+      try {
+        const parsed = JSON.parse(body.slice(i))
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          context = body.slice(i)
+          message = body.slice(0, i).trim()
+          break
+        }
+      } catch {
+        /* 不是合法 JSON 尾段，继续往左找 */
+      }
+    }
+    return { operation, target, code, message, context, raw: text }
+  }
+
   /**
    * 把服务端诊断串压缩成一句话摘要（完整串留给 title）。
-   * 诊断串形如：
-   *   [states] operation=校验会话 cwd target=/... input_summary=2 个会话的 cwd 不是
-   *   POSIX 绝对路径 error_code=Error message=非绝对 cwd 已降级为空工作区
-   * 取其中的 input_summary / message 段即可表达"发生了什么"。
+   * 规范格式下直接取 message 段表达「发生了什么」；
+   * 解析不出（历史 key=value 串 / 非本插件产出）时回落到旧的 key=value 抽取。
    */
   function summarizeWarning(raw) {
     const text = str(raw)
     if (text === '') return '有一条非致命提示（悬停查看详情）'
-    // 优先取 message=（最贴近人话），其次 input_summary=。
+    const parsed = parseWarningLine(text)
+    if (parsed !== null && parsed.message !== '') {
+      return parsed.message.length > 60 ? parsed.message.slice(0, 60) + '…' : parsed.message
+    }
+    // 兜底一：规范格式但没有 message 段 → 用 CODE + target 表达
+    if (parsed !== null) {
+      const fb = (parsed.code === '' ? '' : parsed.code) + (parsed.target === '' ? '' : ' ' + parsed.target)
+      if (fb !== '') return fb.length > 60 ? fb.slice(0, 60) + '…' : fb
+    }
+    // 兜底二：历史 key=value 形态（保留仅为向后兼容，**不作为预期/故障判定依据**）
     const pick = (key) => {
       const m = text.match(new RegExp(key + '=([^]*?)(?=\\s+[a-z_]+=|$)'))
       return m !== null && m !== undefined ? str(m[1]).trim() : ''
     }
     const msg = pick('message') || pick('input_summary')
     if (msg !== '') return msg.length > 60 ? msg.slice(0, 60) + '…' : msg
-    // 兜底：整串截断。
+    // 兜底三：整串截断。
     return text.length > 60 ? text.slice(0, 60) + '…' : text
   }
 
+/**
+ * 预期行为（非故障）的 error_code → 合并文案。
+ *
+ * ⚠️ 这张表覆盖了服务端**全部**设计内降级码（states.js + overview.js 两个产出方），
+ * 逐条列全是有意的：漏一个码，那类降级就会以「真故障」的姿态常驻刷屏 ——
+ * 这正是本次用户投诉的现象（2026-10-07 真机 e2e 就抓到漏网的
+ * EXCERPT_BUDGET_EXHAUSTED）。新增降级码时必须同步登记到这张表。
+ *
+ * 判定口径只有一条：**这是插件为了保护宿主/自己主动做的让步吗？**
+ *   是 → 预期（折叠，不常驻打扰）
+ *   否 → 故障（常驻可见）—— 包括读不到、解析失败、llm 不可用、生成失败。
+ *
+ * 顺序即展示顺序，是这张表的数组顺序（不是对象枚举顺序）—— 保证确定性。
+ */
+const EXPECTED_WARNING_GROUPS = [
+  // ── 总览页（src/overview.js）：扫描/摘录的上限保护 ──
+  { code: 'WORKSPACE_TRUNCATED', label: (n) => n + ' 个工作区的笔记已截断（文件数/体积超限）' },
+  { code: 'FILE_TOO_LARGE', label: (n) => n + ' 个超大文件已被跳过（单文件超过体积上限）' },
+  { code: 'ENTRY_BUDGET_EXCEEDED', label: (n) => n + ' 处目录扫描触达条目上限，子目录未继续深入' },
+  { code: 'EXCERPT_BUDGET_EXHAUSTED', label: (n) => n + ' 处笔记摘录预算用尽（超出的文件只列路径）' },
+  { code: 'SESSION_SCAN_CAPPED', label: (n) => n + ' 处会话扫描达到文件数上限（更早的会话未纳入）' },
+  // ── cwd 归一化（overview.js 与 states.js 共用同一码，因此两边合并成一条）──
+  { code: 'CWD_NOT_ABSOLUTE', label: (n) => n + ' 个会话/目录的 cwd 不是绝对路径，已降级' },
+  { code: 'CWD_NOT_ABSOLUTE_MANY', label: (n) => n + ' 条非绝对路径已全部丢弃' },
+  // ── 三态扫描（src/states.js）──
+  { code: 'SESSION_LOG_MISSING', label: (n) => n + ' 个会话没有可读的会话日志，已按「不判活」处理' },
+  { code: 'DUPLICATE_SESSION_ID', label: (n) => n + ' 条重复的会话投影已去重' },
+  // ── 生成路径（src/index.js）：省 token 的设计内复用 ──
+  { code: 'NOTE_CACHE_REUSED', label: (n) => n + ' 处复用了上次生成结果（笔记未变化，未调用模型）' },
+  { code: 'NOTE_PERSISTED_REUSED', label: (n) => n + ' 处复用了已落盘的总结（笔记指纹一致，未调用模型）' },
+  // ── 生成路径（src/index.js）：没有笔记就没有可总结的内容 ──
+  // ⚠️ 2026-10-07 新增。跳过空工作区是**主动省钱**的设计内让步（实测 21 个工作区里
+  //    8 个是 0 文件，旧实现照样发起模型调用、只能回「摘录不足以判断」），
+  //    不是故障。漏登记这一条，它就会以「真故障」的姿态常驻刷屏 —— 上一轮刚踩过这个坑。
+  { code: 'EMPTY_WORKSPACE_SKIPPED', label: (n) => n + ' 个工作区没有笔记类文件，已跳过生成（未调用模型）' },
+];
+
   /**
-   * 非致命提示条。
+   * 把服务端 warnings 折成「故障（常驻）」与「说明（折叠）」两堆。
+   *
+   * 预期项 → 折叠成一行「N 项说明性提示」，默认收起、不常驻；
+   * 真故障 → 与之前一致地常驻可见，绝不折叠、绝不丢弃。
+   * 顺序：先按判定表序输出合并项，再按原始数组下标序输出未合并单条 → 同输入必同输出。
+   */
+  function classifyWarnings(warnings) {
+    const list = (Array.isArray(warnings) ? warnings : []).map(str).filter((text) => text !== '')
+    const info = list.map(parseWarningLine)
+    const expectedCodes = EXPECTED_WARNING_GROUPS.map((g) => g.code)
+    const used = []
+    for (let i = 0; i < list.length; i += 1) used.push(false)
+    const faults = []
+    const notes = []
+
+    for (const group of EXPECTED_WARNING_GROUPS) {
+      const members = []
+      for (let i = 0; i < info.length; i += 1) {
+        if (used[i] === true) continue
+        if (info[i] !== null && info[i].code === group.code) {
+          members.push(i)
+          used[i] = true
+        }
+      }
+      if (members.length === 0) continue
+      notes.push({
+        key: 'we:' + group.code,
+        text: group.label(members.length),
+        detail: members.map((i) => list[i]).join('\n'),
+        count: members.length,
+        grouped: true,
+      })
+    }
+
+    for (let i = 0; i < list.length; i += 1) {
+      if (used[i] === true) continue
+      const parsed = info[i]
+      const isExpected = parsed !== null && expectedCodes.indexOf(parsed.code) !== -1
+      const item = {
+        key: 'w:' + i,
+        text: summarizeWarning(list[i]),
+        detail: list[i],
+        count: 1,
+        grouped: false,
+      }
+      if (isExpected) notes.push(item)
+      else faults.push(item)
+    }
+    return { faults, notes }
+  }
+
+  /** 非致命提示条（端点未就绪、服务端 faults 等）。 */
+  /**
    * text 是**给人看的一句话摘要**；detail 是完整诊断串，只放在 title 里悬停可见。
    * 这样警告不会因为太长而挤占会话列表空间。
    */
@@ -1227,6 +1726,25 @@ export function createSidebarUi(options) {
       role: 'status',
       title: typeof props.detail === 'string' && props.detail.length > 0 ? props.detail : undefined,
     }, props.text)
+  }
+
+  /**
+   * 说明性提示的**折叠块**（2026-10-07）。默认收起 → 界面上只常驻一行标题；
+   * 展开后逐条显示、悬停还能看到完整原串。「不常驻打扰」与「不丢信息」同时满足。
+   * 与 ui/overview.js 的 NoticeNotes 语义逐字一致（两个工厂各有一份实现）。
+   */
+  function WarnNotes(props) {
+    const items = Array.isArray(props.items) ? props.items : []
+    const count = items.reduce((sum, item) => sum + (typeof item.count === 'number' ? item.count : 1), 0)
+    const detail = items
+      .map((item) => (item.grouped === true ? item.text + '\n' + item.detail : item.detail))
+      .join('\n')
+    return el('details', { className: 'as_warnNotes', title: detail },
+      el('summary', { className: 'as_warnNotes_summary' }, '说明性提示（' + String(count) + ' 项，点击展开查看）'),
+      el('ul', { className: 'as_warnNotes_list' },
+        items.map((item) => el('li', { className: 'as_warnNotes_item', key: item.key, title: item.detail }, item.text)),
+      ),
+    )
   }
 
   /** 空态：加载中 / 无数据 / 端点暂不可用 —— 三种都只显示文案，不报错。 */
@@ -1392,14 +1910,78 @@ export function createSidebarUi(options) {
     // 否则两层各自 readCollapsed，会出现「点了收起但外层仍画长窗」的矛盾。
     const isCollapsed = config.forceExpanded === true ? false : collapsed
 
+    // 问题二：「已完成未查看」的时间筛选（默认最近 7 天，可切全部）。
+    // 只影响 unseen 这一组；running / approval 永远全量显示（它们本来就是「当下」的事）。
+    const filterState = React.useState(readUnseenFilter)
+    const unseenFilter = filterState[0]
+    const setUnseenFilter = filterState[1]
+    // 批量标记已读的结果提示（成功/失败都要有一行可诊断文案，不能静默）。
+    const [markNotice, setMarkNotice] = React.useState(null)
+    const [marking, setMarking] = React.useState(false)
+    // 跳转失败提示（2026-10-07）：selectEntry 的返回值无人消费，失败必须显式冒泡到这里，
+    // 否则用户点卡片没反应却看不到任何原因（真机验收实测的静默失效）。
+    const [navNotice, setNavNotice] = React.useState(null)
+    React.useEffect(() => {
+      function onNavFailed(event) {
+        const detail = event !== null && event !== undefined ? event.detail : null
+        if (detail === null || detail === undefined) return
+        setNavNotice({
+          errorCode: detail.errorCode !== undefined ? detail.errorCode : 'NAVIGATION_FAILED',
+          text: '跳转到该会话失败（' + String(detail.errorCode !== undefined ? detail.errorCode : 'NAVIGATION_FAILED') + '）：' + String(detail.reason !== undefined ? detail.reason : '未知原因'),
+        })
+      }
+      if (typeof window === 'undefined' || window === null || typeof window.addEventListener !== 'function') return undefined
+      window.addEventListener(NAVIGATION_EVENT, onNavFailed)
+      return () => { window.removeEventListener(NAVIGATION_EVENT, onNavFailed) }
+    }, [])
     const total = data.snapshot.counts.total
     const now = toPositive(config.now) > 0 ? toPositive(config.now) : Date.now()
-    const groups = groupByState(data.snapshot.entries)
+    // ⚠️ 必须**只把 unseen 交给 partitionUnseen**：它是纯时间筛选器，不认 state。
+    // 若把全量 entries（含 running/approval）喂进去，hidden 会把「运行中/待审批」
+    // 也算成「被时间筛掉的已完成会话」，提示语就会说谎（首版接线正是这么错的）。
+    // 切完再交给 groupByState：counts 是服务端全量口径，列表被筛过是正常的，
+    // 差异由下面那行「另有 N 条…」显式说明，而不是让用户以为数据丢了。
+    const allEntries = data.snapshot.entries
+    const unseenEntries = []
+    const entriesForList = []
+    for (const entry of allEntries) {
+      if (asRecord(entry) !== null && entry.state === 'unseen') unseenEntries.push(entry)
+      else entriesForList.push(entry)
+    }
+    const split = partitionUnseen(unseenEntries, unseenFilter, now)
+    const unseenVisible = split.visible
+    for (let i = 0; i < split.visible.length; i += 1) entriesForList.push(split.visible[i])
+    const groups = groupByState(entriesForList)
 
     const toggle = () => {
       const next = collapsed !== true
       setCollapsed(next)
       writeCollapsed(next)
+    }
+
+    // 切换筛选：写 localStorage + 立刻重渲染（不用等下一轮轮询）。
+    const switchFilter = (next) => {
+      const applied = writeUnseenFilter(next)
+      setUnseenFilter(applied)
+      setMarkNotice(null)
+    }
+
+    // 「全部标记已读」的作用范围必须与**当前筛选一致**：只看 7 天就只清 7 天。
+    // 按钮文案显式写出范围，避免用户以为清掉了全部。
+    const markAllVisibleSeen = () => {
+      if (marking === true) return
+      setMarking(true)
+      const ids = unseenVisible.map((entry) => str(entry.id)).filter((id) => id !== '')
+      markAllSeen(ids, { endpoint: str(config.seenEndpoint) !== '' ? config.seenEndpoint : undefined, fetch: config.fetch })
+        .then((result) => {
+          setMarking(false)
+          if (result.ok === true) {
+            setMarkNotice({ ok: true, text: '已标记 ' + String(result.applied) + ' 条为已读（范围：' + (unseenFilter === 'all' ? '全部' : '最近 ' + String(UNSEEN_RECENT_DAYS) + ' 天') + '）' })
+            if (typeof config.onRefresh === 'function') config.onRefresh()
+          } else {
+            setMarkNotice({ ok: false, text: '标记已读失败（error_code=' + String(result.errorCode) + '），可稍后重试' })
+          }
+        })
     }
 
     if (isCollapsed === true) return el(Pill, { total, onExpand: toggle })
@@ -1411,10 +1993,30 @@ export function createSidebarUi(options) {
     }
     // 服务端 warnings 是**完整诊断串**（含 operation/target/error_code/context），
     // 实测单条就有 100+ 字符，直接铺在界面上会把面板占满、对用户是噪音。
-    // 这里只显示**一句话摘要**，完整串放进 title（鼠标悬停可见）——
-    // 既保持可诊断性，又不让警告挤占会话列表空间。
-    for (const warning of data.snapshot.warnings) {
-      notices.push(el(Warn, { key: 'warn:' + warning, text: summarizeWarning(warning), detail: warning }))
+    //
+    // 2026-10-07：此前这里是**无条件逐条 push**，用户截图里的两条
+    //（「这些会话没有可读的 session*.jsonl.zstd…」「非绝对 cwd 已降级…」）
+    // 就是这么来的 —— 它们是**预期降级**，不是故障。
+    // 现在按 classifyWarnings 分流：
+    //   · 预期项 → 收进默认收起的 <details>，界面上只常驻一行标题；
+    //   · 真故障 → 保持逐条常驻（摘要 + 完整串进 title），行为与之前一致。
+    // 与工作总览页（ui/overview.js）行为**完全一致**。
+    const classified = classifyWarnings(data.snapshot.warnings)
+    for (const fault of classified.faults) {
+      notices.push(el(Warn, { key: fault.key, text: fault.text, detail: fault.detail }))
+    }
+    if (classified.notes.length > 0) {
+      notices.push(el(WarnNotes, { key: 'as-notes', items: classified.notes }))
+    }
+    // 跳转失败提示（2026-10-07）：必须是**可见**的一条，不能只放进 console。
+    // 真机验收实测：点卡片毫无反应、控制台也无告警 —— 因为 selectEntry 的返回值没人消费。
+    // 现在由 NAVIGATION_EVENT 冒泡上来，这里渲染成与其它警告同款的提示条。
+    if (navNotice !== null) {
+      notices.push(el(Warn, {
+        key: 'nav-failed',
+        text: '跳转失败：' + String(navNotice.errorCode),
+        detail: 'operation=openSession target=uiWorkspace.openSession error_code=' + String(navNotice.errorCode) + ' | ' + String(navNotice.text),
+      }))
     }
 
     return el('aside', {
@@ -1438,12 +2040,126 @@ export function createSidebarUi(options) {
         onToggleLock: typeof config.onToggleLock === 'function' ? config.onToggleLock : null,
       }),
       notices.length > 0 ? notices : null,
+      // 问题二：unseen 时间筛选 + 「全部标记已读」。
+      // 放在标题栏与列表之间（而不是塞进 unseen 分组标题）有两个原因：
+      //   1) 分组标题宽度只有 ~120px（「已完成未查看」6 个字已经占满），塞不下两个控件；
+      //   2) 控件是**跨分组**的设置（决定 unseen 这一组显示多少），放进分组标题里
+      //      会让人误以为它只作用于那个分组。
+      el('div', { className: 'as_filterBar' },
+        el('span', { className: 'as_filterLabel' }, '已完成未查看'),
+        el('button', {
+          type: 'button',
+          className: 'as_filterBtn' + (unseenFilter === 'recent' ? ' as_filterBtn_on' : ''),
+          'aria-pressed': unseenFilter === 'recent',
+          'data-as-unseen-filter': 'recent',
+          title: '只看最近 ' + String(UNSEEN_RECENT_DAYS) + ' 天做的会话',
+          onClick: () => { switchFilter('recent') },
+        }, '近 ' + String(UNSEEN_RECENT_DAYS) + ' 天'),
+        el('button', {
+          type: 'button',
+          className: 'as_filterBtn' + (unseenFilter === 'all' ? ' as_filterBtn_on' : ''),
+          'aria-pressed': unseenFilter === 'all',
+          'data-as-unseen-filter': 'all',
+          title: '显示有史以来全部已完成未查看的会话',
+          onClick: () => { switchFilter('all') },
+        }, '全部'),
+        unseenVisible.length > 0
+          ? el('button', {
+              type: 'button',
+              className: 'as_filterBtn as_filterBtn_action',
+              'data-as-mark-all-seen': unseenFilter,
+              disabled: marking === true,
+              // 文案写清作用范围：只看 7 天就只清 7 天，不让用户以为清了全部。
+              title: '把当前范围内 ' + String(unseenVisible.length) + ' 条已完成未查看的会话标记为已读（范围：' + (unseenFilter === 'all' ? '全部' : '最近 ' + String(UNSEEN_RECENT_DAYS) + ' 天') + '）',
+              onClick: markAllVisibleSeen,
+            }, marking === true ? '标记中…' : '全部标记已读（' + String(unseenVisible.length) + '）')
+          : null,
+      ),
+      split.hidden > 0 && unseenFilter !== 'all'
+        ? el('div', { className: 'as_filterHint' }, '另有 ' + String(split.hidden) + ' 条超过 ' + String(UNSEEN_RECENT_DAYS) + ' 天的已完成会话，已折叠（切到「全部」可查看）')
+        : null,
+      markNotice !== null
+        ? el('div', {
+            className: 'as_warn',
+            role: 'status',
+            title: 'operation=markAllSeen target=' + str(config.seenEndpoint !== undefined ? config.seenEndpoint : SEEN_ENDPOINT) + ' error_code=' + (markNotice.ok === true ? 'NONE' : 'MARK_ALL_FAILED'),
+          }, markNotice.text)
+        : null,
       el('div', { className: 'as_body' },
         groups.length === 0
           ? el(Empty, { phase: data.phase })
           : groups.map((group) => el(Group, { key: group.key, group, onSelect: config.onSelect, now })),
       ),
     )
+  }
+
+  // ── Bug 3（2026-10-06，用户实测「点侧栏图标会抢走中间工作区」）────────────
+  // 背景（宿主契约，已读源码确认，**不要试图绕过**）：
+  //   1. dsh-client-ui-sidebar/lib/client.js 的 PanelRow，onClick **硬编码**
+  //      `selectPanel(id)`，插件没有任何拦截机会；
+  //   2. dsh-client-ui-layout 的 LayoutController.selectPanel：
+  //      `if (panelId !== null && !this.hasMainPanel(panelId)) throw` ——
+  //      所以 main 槽位**必须**保留注册，删掉就一点击就抛异常（旧代码注释写的正是这条）。
+  //
+  // 那 main 槽位该渲染什么？读 MainPanel 的实现可知：
+  //   renderSlot("main", {}, { entryKey: activePanelId ?? "conversation" })
+  // keyed 槽位**只渲染命中的那一个 entry**（dsh-client-ui-renderer L827-829）。
+  // 也就是说：只要 activePanelId 被设成 'active-sessions'，对话内容就一定被替换 ——
+  // 哪怕我们渲染 null，中间也只会剩下一个**空白**的中央列，用户仍然会觉得「被抢走了」。
+  //
+  // 所以修法是两件事一起做：
+  //   ① main 槽位注册一个**不渲染任何可见内容**的组件（不再画 .as_root 全屏列表）；
+  //   ② 它挂载时立刻 `layout.selectPanel(null)` 把 main 槽位**还给 conversation** ——
+  //      这才是真正做到「中间工作区保持原样」。
+  // 效果：点侧栏图标 → 浮层唤回 + 中间对话原封不动。
+  // ctx.layout 缺失时（极老宿主 / 单测桩）退化为「只唤回浮层、中间留空」，不会崩。
+  let layoutFace = null;
+
+  /** 记下宿主的跨插件动作面（apply 时从 ctx.layout 取）。 */
+  function bindLayoutFace(face) {
+    layoutFace = asRecord(face) === null ? null : face;
+  }
+
+  /**
+   * 把 main 槽位交还给 conversation（activePanelId -> null）。
+   * @returns {boolean} 是否真的交还了（false = 没有 layout 面 / 宿主抛错）
+   */
+  function handBackToConversation() {
+    const face = layoutFace;
+    if (face === null || face === undefined || typeof face.selectPanel !== 'function') {
+      return false;
+    }
+    try {
+      // selectPanel(null) 是宿主自己的「回到对话」语义（dsh-client-ui-workspace 也在用）。
+      face.selectPanel(null);
+      return true;
+    } catch (error) {
+      warnOnce('main:handBack', '交还 main 槽位失败（中间列可能留空）：' + describeError(error));
+      return false;
+    }
+  }
+
+  /**
+   * `main` 槽位的挂载体：**不渲染任何可见内容**，只负责「唤回浮层 + 交还中央列」。
+   *
+   * 为什么不是直接 `return null` 就完事：见上面 handBackToConversation 的注释 ——
+   * 渲染 null 只是把「全屏列表」换成「空白中央列」，对话一样回不来。
+   *
+   * 为什么不用 Component：Component 是给 sidebar.panellist 渲染紧凑 glyph 的，
+   * 且默认分支是 FullPane（.as_root 全屏）。复用它会重新引入 Bug 3，
+   * 也会破坏 panellist 的 glyph 渲染 —— 所以这里是一个**独立**组件。
+   */
+  function MainSlotHost() {
+    // ⚠️ hook 必须在任何 return 之前（与 Component 同一条纪律，见那里的注释）。
+    React.useEffect(() => {
+      // 唤回浮层：用户点侧栏「活跃会话」图标 = 「我想看活跃会话」。
+      // 这条机制原封不动地保留 —— 用户要的正是它。
+      writeCollapsed(false);
+      // 再把中央列还给对话，避免「点一下图标就把工作区内容弄没了」。
+      handBackToConversation();
+    }, []);
+    injectStyles();
+    return null;
   }
 
   /**
@@ -1735,9 +2451,28 @@ export function createSidebarUi(options) {
       Component,
     ))
     // main 是 keyed 槽位：key 必须与上面的 id 完全一致，否则点击找不到目标。
+    // ⚠️ 注册的是 MainSlotHost 而不是 Component（Bug 3）：它不渲染任何可见内容，
+    // 挂载时唤回浮层并把中央列交还给对话。**绝不能删掉这条注册** ——
+    // 删掉后 LayoutController.selectPanel 会直接抛
+    // `main panel "active-sessions" is not registered`，一点击就崩。
+    bindLayoutFace(ctx.layout)
+  // 问题三：绑定宿主会话跳转面 —— **惰性**。
+  // 为什么用 ctx.get 而不是 inject：见 bindWorkspaceFace 上方的结论 ——
+  // ctx.get 服务缺席返回 undefined，天然可选；inject 缺席会让整个包停在 pending。
+  //
+  // ⚠️ 2026-10-07 真机验收实测：apply 时**不能**一次性取值并缓存。
+  //   cordis 的 get(name, strict=true) 在提供者 fiber.state !== 2（未激活）时返回 undefined，
+  //   而本包 apply 早于 ui-workspace 的 fiber 激活 → 永久缓存了 undefined → 点击静默失效。
+  //   改为把 ctx 交给解析器，点击那一刻再实名求值（届时所有 fiber 早已激活）。
+  bindWorkspaceFace(() => {
+    if (typeof ctx.get !== 'function') return null
+    // strict 显式传 false：拿「已注册但 fiber 正在切换」的实现也比拿不到强，
+    // 且我们已在点击路径上 try/catch，不会因服务瞬时不可用而崩。
+    return ctx.get('uiWorkspace', false) ?? null
+  });
     const disposeMain = ctx.slots.inject('main', () => ctx.slots.register(
       { name: 'main', key: PANEL_ID },
-      Component,
+      MainSlotHost,
     ))
 
     // shell.overlay：帧级浮层 —— 这是「左侧常驻长窗」的正确挂载点。
@@ -1767,6 +2502,7 @@ export function createSidebarUi(options) {
 
   return {
     Component,
+    MainSlotHost,
     OverlayHost,
     PaneComponent: Component,
     apply,
@@ -1775,7 +2511,14 @@ export function createSidebarUi(options) {
     // Pill 仍在列表里：槽位内嵌形态（Component / main 面板）的收起态继续用它，
     // 只有 overlay 形态不再渲染它。几何相关的纯函数一并导出，供自测直接单测。
     internals: {
-      Pill, GlyphPane, Head, Warn, Empty, Card, RelationLine, Cluster, Group, FullPane, useSnapshot, summarizeWarning,
+      Pill, GlyphPane, Head, Warn, WarnNotes, Empty, Card, RelationLine, Cluster, Group, FullPane, useSnapshot, summarizeWarning,
+      // 2026-10-07：警告的「预期 vs 故障」判定面（供单测与总览页对照）
+      parseWarningLine, classifyWarnings, EXPECTED_WARNING_GROUPS,
+      MainSlotHost, bindLayoutFace, handBackToConversation,
+      // 问题二 / 问题三 的可测面
+      readUnseenFilter, writeUnseenFilter, partitionUnseen, markAllSeen,
+      bindWorkspaceFace, hasWorkspaceFace, resolveWorkspaceFace, resetWorkspaceFace, openSessionInHost, selectEntry,
+      NAVIGATION_EVENT,
       measureOverlayTop, viewportHeight, maxOverlayHeight, defaultOverlayHeight,
       clampOverlayWidth, clampOverlayHeight, readOverlayGeometry, writeOverlayGeometry, readLocked, writeLocked,
       subscribeCollapsed, collapseSubscriberCount,
@@ -1785,8 +2528,15 @@ export function createSidebarUi(options) {
 
 // ───────────── 模块级便捷导出（兼容 / 自测） ─────────────
 
-/** 依赖声明：只依赖 slots，不注册任何模型可见工具（0 token 硬约束）。 */
-export const inject = ['slots']
+/**
+ * 依赖声明：只依赖 slots + layout，**不注册任何模型可见工具**（0 token 硬约束）。
+ *
+ * ⚠️ 2026-10-06 新增 'layout'：Bug 3 的修法需要 `ctx.layout.selectPanel(null)`
+ * 把 main 槽位交还给对话。layout 是 dsh-client-ui-layout 通过 ctx.reflect.provide
+ * 暴露的跨插件动作面，官方侧栏自己也是 `inject = ["slots","layout",...]`。
+ * 缺了它 main 槽位只能渲染空白中央列（不崩，但用户仍会以为内容被抢走）。
+ */
+export const inject = ['slots', 'layout']
 
 let defaultUi = null
 /** 惰性单例：给模块级 apply / PaneComponent 用（React 走 globalThis 探测）。 */
@@ -1811,4 +2561,8 @@ export default {
   measureOverlayTop, viewportHeight, maxOverlayHeight, defaultOverlayHeight,
   clampOverlayWidth, clampOverlayHeight, readOverlayGeometry, writeOverlayGeometry, readLocked, writeLocked,
   subscribeCollapsed, collapseSubscriberCount,
+  // 问题二 / 问题三 的对外可测面
+  readUnseenFilter, writeUnseenFilter, partitionUnseen, markAllSeen, UNSEEN_FILTER_KEY, UNSEEN_RECENT_DAYS,
+  bindWorkspaceFace, hasWorkspaceFace, resolveWorkspaceFace, resetWorkspaceFace, openSessionInHost,
+  NAVIGATION_EVENT,
 }
